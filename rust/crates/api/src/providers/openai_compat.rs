@@ -41,8 +41,10 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const LOCAL_ENV_VARS: &[&str] = &["LOCAL_API_KEY"];
-const LMSTUDIO_ENV_VARS: &[&str] = &["LMSTUDIO_API_KEY"];
+const LMSTUDIO_ENV_VARS: &[&str] = &["LMSTUDIO_API_KEY", "LM_API_TOKEN"];
 const OLLAMA_ENV_VARS: &[&str] = &["OLLAMA_API_KEY"];
+const LMSTUDIO_DEFAULT_LOAD_CONTEXT_LENGTH: u32 = 64_000;
+const LMSTUDIO_PRELOAD_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -160,7 +162,7 @@ impl OpenAiCompatClient {
     }
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
-        let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+        let Some(api_key) = read_first_env_non_empty(config.credential_env_vars())? else {
             if !config.auth_required {
                 return Ok(Self::without_auth(config));
             }
@@ -263,6 +265,7 @@ impl OpenAiCompatClient {
         &self,
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
+        self.preload_lmstudio_model_best_effort(request).await;
         let request_url = chat_completions_endpoint(&self.base_url);
         let request = self
             .http
@@ -276,6 +279,39 @@ impl OpenAiCompatClient {
                 request
             };
         request.send().await.map_err(ApiError::from)
+    }
+
+    async fn preload_lmstudio_model_best_effort(&self, request: &MessageRequest) {
+        if self.config.provider_kind != ProviderKind::LmStudio || !lmstudio_preload_enabled() {
+            return;
+        }
+
+        let model = model_name_for_provider_request(&request.model, ProviderKind::LmStudio);
+        if model.trim().is_empty() {
+            return;
+        }
+
+        let endpoint = lmstudio_model_load_endpoint(&self.base_url);
+        let preload = self
+            .http
+            .post(endpoint)
+            .header("content-type", "application/json")
+            .json(&json!({
+                "model": model,
+                "context_length": LMSTUDIO_DEFAULT_LOAD_CONTEXT_LENGTH,
+            }));
+        let preload =
+            if let Some(api_key) = self.api_key.as_deref().filter(|value| !value.is_empty()) {
+                preload.bearer_auth(api_key)
+            } else {
+                preload
+            };
+
+        if let Ok(Ok(response)) =
+            tokio::time::timeout(LMSTUDIO_PRELOAD_TIMEOUT, preload.send()).await
+        {
+            let _ = response.bytes().await;
+        }
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -945,6 +981,15 @@ fn read_env_non_empty(key: &str) -> Result<Option<String>, ApiError> {
     }
 }
 
+fn read_first_env_non_empty(keys: &[&str]) -> Result<Option<String>, ApiError> {
+    for key in keys {
+        if let Some(value) = read_env_non_empty(key)? {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
 #[must_use]
 pub fn has_api_key(key: &str) -> bool {
     read_env_non_empty(key)
@@ -955,7 +1000,13 @@ pub fn has_api_key(key: &str) -> bool {
 
 #[must_use]
 pub fn read_base_url(config: OpenAiCompatConfig) -> String {
-    std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string())
+    let base_url =
+        std::env::var(config.base_url_env).unwrap_or_else(|_| config.default_base_url.to_string());
+    if config.provider_kind == ProviderKind::LmStudio {
+        normalize_lmstudio_inference_base_url(&base_url)
+    } else {
+        base_url
+    }
 }
 
 fn chat_completions_endpoint(base_url: &str) -> String {
@@ -965,6 +1016,45 @@ fn chat_completions_endpoint(base_url: &str) -> String {
     } else {
         format!("{trimmed}/chat/completions")
     }
+}
+
+fn normalize_lmstudio_inference_base_url(base_url: &str) -> String {
+    let mut trimmed = base_url.trim().trim_end_matches('/').to_string();
+    if !trimmed.contains("://") && !trimmed.starts_with('/') {
+        trimmed = format!("http://{trimmed}");
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.ends_with("/api/v1") {
+        let server_base = &trimmed[..trimmed.len() - "/api/v1".len()];
+        format!("{server_base}/v1")
+    } else if lower.ends_with("/v1") {
+        trimmed
+    } else {
+        format!("{trimmed}/v1")
+    }
+}
+
+fn lmstudio_server_base_url(base_url: &str) -> String {
+    let inference_base = normalize_lmstudio_inference_base_url(base_url);
+    inference_base
+        .strip_suffix("/v1")
+        .unwrap_or(&inference_base)
+        .to_string()
+}
+
+fn lmstudio_model_load_endpoint(base_url: &str) -> String {
+    format!("{}/api/v1/models/load", lmstudio_server_base_url(base_url))
+}
+
+fn lmstudio_preload_enabled() -> bool {
+    !matches!(
+        std::env::var("LMSTUDIO_PRELOAD")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "off" | "no"
+    )
 }
 
 fn request_id_from_headers(headers: &reqwest::header::HeaderMap) -> Option<String> {
@@ -1031,7 +1121,8 @@ impl StringExt for String {
 mod tests {
     use super::{
         build_chat_completion_request, chat_completions_endpoint, normalize_finish_reason,
-        openai_tool_choice, parse_tool_arguments, OpenAiCompatClient, OpenAiCompatConfig,
+        normalize_lmstudio_inference_base_url, openai_tool_choice, parse_tool_arguments,
+        OpenAiCompatClient, OpenAiCompatConfig,
     };
     use crate::error::ApiError;
     use crate::types::{
@@ -1153,6 +1244,22 @@ mod tests {
     }
 
     #[test]
+    fn lmstudio_accepts_lm_api_token_fallback() {
+        let _lock = env_lock();
+        let original_lmstudio_api_key = std::env::var_os("LMSTUDIO_API_KEY");
+        let original_lm_api_token = std::env::var_os("LM_API_TOKEN");
+        std::env::remove_var("LMSTUDIO_API_KEY");
+        std::env::set_var("LM_API_TOKEN", "lm-token");
+
+        let client = OpenAiCompatClient::from_env(OpenAiCompatConfig::lmstudio())
+            .expect("lm api token should satisfy LM Studio auth");
+
+        assert_eq!(client.api_key.as_deref(), Some("lm-token"));
+        restore_env("LMSTUDIO_API_KEY", original_lmstudio_api_key);
+        restore_env("LM_API_TOKEN", original_lm_api_token);
+    }
+
+    #[test]
     fn endpoint_builder_accepts_base_urls_and_full_endpoints() {
         assert_eq!(
             chat_completions_endpoint("https://api.x.ai/v1"),
@@ -1168,11 +1275,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn lmstudio_base_url_normalization_accepts_server_and_api_urls() {
+        assert_eq!(
+            normalize_lmstudio_inference_base_url("127.0.0.1:1234"),
+            "http://127.0.0.1:1234/v1"
+        );
+        assert_eq!(
+            normalize_lmstudio_inference_base_url("http://127.0.0.1:1234/api/v1"),
+            "http://127.0.0.1:1234/v1"
+        );
+        assert_eq!(
+            normalize_lmstudio_inference_base_url("http://127.0.0.1:1234/v1"),
+            "http://127.0.0.1:1234/v1"
+        );
+    }
+
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .expect("env lock")
+    }
+
+    fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
     }
 
     #[test]
