@@ -1610,11 +1610,19 @@ fn run_logout(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 
 fn open_browser(url: &str) -> io::Result<()> {
     let commands = if cfg!(target_os = "macos") {
-        vec![("open", vec![url])]
+        vec![("open".to_string(), vec![url.to_string()])]
     } else if cfg!(target_os = "windows") {
-        vec![("cmd", vec!["/C", "start", "", url])]
+        vec![(
+            "cmd".to_string(),
+            vec![
+                "/C".to_string(),
+                "start".to_string(),
+                String::new(),
+                format!("\"{url}\""),
+            ],
+        )]
     } else {
-        vec![("xdg-open", vec![url])]
+        vec![("xdg-open".to_string(), vec![url.to_string()])]
     };
     for (program, args) in commands {
         match Command::new(program).args(args).spawn() {
