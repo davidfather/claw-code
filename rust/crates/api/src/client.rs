@@ -1,6 +1,7 @@
 use crate::error::ApiError;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 use crate::providers::anthropic::{self, AnthropicClient, AuthSource};
+use crate::providers::ollama::{self, OllamaClient};
 use crate::providers::openai_compat::{self, OpenAiCompatClient, OpenAiCompatConfig};
 use crate::providers::{self, ProviderKind};
 use crate::types::{MessageRequest, MessageResponse, StreamEvent};
@@ -13,7 +14,7 @@ pub enum ProviderClient {
     OpenAi(OpenAiCompatClient),
     Local(OpenAiCompatClient),
     LmStudio(OpenAiCompatClient),
-    Ollama(OpenAiCompatClient),
+    Ollama(OllamaClient),
 }
 
 impl ProviderClient {
@@ -43,9 +44,7 @@ impl ProviderClient {
             ProviderKind::LmStudio => Ok(Self::LmStudio(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::lmstudio(),
             )?)),
-            ProviderKind::Ollama => Ok(Self::Ollama(OpenAiCompatClient::from_env(
-                OpenAiCompatConfig::ollama(),
-            )?)),
+            ProviderKind::Ollama => Ok(Self::Ollama(OllamaClient::from_env()?)),
         }
     }
 
@@ -106,8 +105,8 @@ impl ProviderClient {
             Self::Xai(client)
             | Self::OpenAi(client)
             | Self::Local(client)
-            | Self::LmStudio(client)
-            | Self::Ollama(client) => client.send_message(request).await,
+            | Self::LmStudio(client) => client.send_message(request).await,
+            Self::Ollama(client) => client.send_message(request).await,
         }
     }
 
@@ -123,11 +122,14 @@ impl ProviderClient {
             Self::Xai(client)
             | Self::OpenAi(client)
             | Self::Local(client)
-            | Self::LmStudio(client)
-            | Self::Ollama(client) => client
+            | Self::LmStudio(client) => client
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
+            Self::Ollama(client) => client
+                .stream_message(request)
+                .await
+                .map(MessageStream::Ollama),
         }
     }
 }
@@ -136,6 +138,7 @@ impl ProviderClient {
 pub enum MessageStream {
     Anthropic(anthropic::MessageStream),
     OpenAiCompat(openai_compat::MessageStream),
+    Ollama(ollama::MessageStream),
 }
 
 impl MessageStream {
@@ -144,6 +147,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.request_id(),
             Self::OpenAiCompat(stream) => stream.request_id(),
+            Self::Ollama(stream) => stream.request_id(),
         }
     }
 
@@ -151,6 +155,7 @@ impl MessageStream {
         match self {
             Self::Anthropic(stream) => stream.next_event().await,
             Self::OpenAiCompat(stream) => stream.next_event().await,
+            Self::Ollama(stream) => stream.next_event().await,
         }
     }
 }

@@ -8,6 +8,7 @@ use crate::error::ApiError;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
+pub mod ollama;
 pub mod openai_compat;
 
 #[allow(dead_code)]
@@ -189,7 +190,7 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
                 provider: ProviderKind::Ollama,
                 auth_env: "OLLAMA_API_KEY",
                 base_url_env: "OLLAMA_BASE_URL",
-                default_base_url: openai_compat::DEFAULT_OLLAMA_OPENAI_BASE_URL,
+                default_base_url: ollama::DEFAULT_BASE_URL,
             }),
             _ => None,
         };
