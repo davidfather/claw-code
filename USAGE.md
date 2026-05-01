@@ -93,14 +93,16 @@ Model aliases currently supported by the CLI:
 - `sonnet` → `claude-sonnet-4-6`
 - `haiku` → `claude-haiku-4-5-20251213`
 
-OpenAI-compatible local model prefixes:
+Local model prefixes:
 
 - `local/<model>` uses `LOCAL_BASE_URL`, defaulting to `http://127.0.0.1:1234/v1`
 - `lmstudio/<model>` uses `LMSTUDIO_BASE_URL`, defaulting to `http://127.0.0.1:1234/v1`
-- `ollama/<model>` uses `OLLAMA_BASE_URL`, defaulting to `http://127.0.0.1:11434/v1`
+- `ollama/<model>` uses native Ollama `/api/chat` via `OLLAMA_BASE_URL`, defaulting to `http://127.0.0.1:11434`
 
 Local prefixes do not require an API key by default. Set `LOCAL_API_KEY`,
-`LMSTUDIO_API_KEY`, or `OLLAMA_API_KEY` if the endpoint expects bearer auth.
+`LMSTUDIO_API_KEY`, `LM_API_TOKEN`, or `OLLAMA_API_KEY` if the endpoint expects
+bearer auth. LM Studio requests best-effort preload the target model before
+chat; set `LMSTUDIO_PRELOAD=0` to disable that preload call.
 
 ```bash
 ./target/debug/claw --model local/qwen3-coder prompt "reply with pong"
