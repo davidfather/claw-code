@@ -26,8 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    OutputContentBlock, PromptCache, ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
+    ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -56,11 +56,7 @@ use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
 fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
+    api::max_tokens_for_model(model)
 }
 const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
@@ -2445,7 +2441,7 @@ struct RuntimeMcpState {
 }
 
 struct BuiltRuntime {
-    runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
+    runtime: Option<ConversationRuntime<CliProviderRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -2454,7 +2450,7 @@ struct BuiltRuntime {
 
 impl BuiltRuntime {
     fn new(
-        runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+        runtime: ConversationRuntime<CliProviderRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
@@ -2499,7 +2495,7 @@ impl BuiltRuntime {
 }
 
 impl Deref for BuiltRuntime {
-    type Target = ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>;
+    type Target = ConversationRuntime<CliProviderRuntimeClient, CliToolExecutor>;
 
     fn deref(&self) -> &Self::Target {
         self.runtime
@@ -5350,7 +5346,7 @@ fn build_runtime_with_plugin_state(
         .map_err(std::io::Error::other)?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
+        CliProviderRuntimeClient::new(
             session_id,
             model,
             enable_tools,
@@ -5457,9 +5453,9 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-struct AnthropicRuntimeClient {
+struct CliProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -5469,7 +5465,7 @@ struct AnthropicRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
 }
 
-impl AnthropicRuntimeClient {
+impl CliProviderRuntimeClient {
     fn new(
         session_id: &str,
         model: String,
@@ -5479,11 +5475,18 @@ impl AnthropicRuntimeClient {
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let provider_kind = api::detect_provider_kind(&model);
+        let client = if matches!(provider_kind, ProviderKind::Anthropic) {
+            ProviderClient::from_model_with_anthropic_auth(
+                &model,
+                Some(resolve_cli_auth_source()?),
+            )?
+        } else {
+            ProviderClient::from_model(&model)?
+        };
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client: client.with_prompt_cache(PromptCache::new(session_id)),
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -5505,7 +5508,7 @@ fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
     })?)
 }
 
-impl ApiClient for AnthropicRuntimeClient {
+impl ApiClient for CliProviderRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
@@ -6306,7 +6309,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));

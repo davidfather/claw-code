@@ -134,6 +134,47 @@ async fn send_message_accepts_full_chat_completions_endpoint_override() {
     assert_eq!(request.path, "/chat/completions");
 }
 
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn local_prefix_strips_provider_and_allows_no_authorization_header() {
+    let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));
+    let body = concat!(
+        "{",
+        "\"id\":\"chatcmpl_local\",",
+        "\"model\":\"qwen3-coder\",",
+        "\"choices\":[{",
+        "\"message\":{\"role\":\"assistant\",\"content\":\"Local endpoint works\",\"tool_calls\":[]},",
+        "\"finish_reason\":\"stop\"",
+        "}],",
+        "\"usage\":{\"prompt_tokens\":6,\"completion_tokens\":3}",
+        "}"
+    );
+    let server = spawn_server(
+        state.clone(),
+        vec![http_response("200 OK", "application/json", body)],
+    )
+    .await;
+
+    let client = OpenAiCompatClient::without_auth(OpenAiCompatConfig::local())
+        .with_base_url(server.base_url());
+    let response = client
+        .send_message(&MessageRequest {
+            model: "local/qwen3-coder".to_string(),
+            ..sample_request(false)
+        })
+        .await
+        .expect("local OpenAI-compatible request should succeed without auth");
+
+    assert_eq!(response.total_tokens(), 9);
+
+    let captured = state.lock().await;
+    let request = captured.first().expect("captured request");
+    assert_eq!(request.path, "/chat/completions");
+    assert_eq!(request.headers.get("authorization"), None);
+    let body: serde_json::Value = serde_json::from_str(&request.body).expect("json body");
+    assert_eq!(body["model"], json!("qwen3-coder"));
+}
+
 #[tokio::test]
 async fn stream_message_normalizes_text_and_multiple_tool_calls() {
     let state = Arc::new(Mutex::new(Vec::<CapturedRequest>::new()));

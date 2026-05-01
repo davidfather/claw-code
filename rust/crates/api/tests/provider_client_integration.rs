@@ -46,6 +46,36 @@ fn provider_client_uses_explicit_anthropic_auth_without_env_lookup() {
 }
 
 #[test]
+fn provider_client_routes_local_prefix_without_credentials() {
+    let _lock = env_lock();
+    let _local_api_key = EnvVarGuard::set("LOCAL_API_KEY", None);
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+    let _anthropic_auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+    let client = ProviderClient::from_model("local/qwen3")
+        .expect("local OpenAI-compatible models should not require credentials");
+
+    assert_eq!(client.provider_kind(), ProviderKind::Local);
+}
+
+#[test]
+fn provider_client_routes_lmstudio_and_ollama_prefixes() {
+    let _lock = env_lock();
+    let _lmstudio_api_key = EnvVarGuard::set("LMSTUDIO_API_KEY", None);
+    let _ollama_api_key = EnvVarGuard::set("OLLAMA_API_KEY", None);
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+    let _anthropic_auth_token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", None);
+
+    let lmstudio = ProviderClient::from_model("lmstudio/local-model")
+        .expect("LM Studio prefix should use optional local auth");
+    let ollama = ProviderClient::from_model("ollama/llama3.2")
+        .expect("Ollama OpenAI-compatible prefix should use optional local auth");
+
+    assert_eq!(lmstudio.provider_kind(), ProviderKind::LmStudio);
+    assert_eq!(ollama.provider_kind(), ProviderKind::Ollama);
+}
+
+#[test]
 fn read_xai_base_url_prefers_env_override() {
     let _lock = env_lock();
     let _xai_base_url = EnvVarGuard::set("XAI_BASE_URL", Some("https://example.xai.test/v1"));

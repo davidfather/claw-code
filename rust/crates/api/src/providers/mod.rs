@@ -33,6 +33,9 @@ pub enum ProviderKind {
     Anthropic,
     Xai,
     OpenAi,
+    Local,
+    LmStudio,
+    Ollama,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -144,7 +147,10 @@ pub fn resolve_model_alias(model: &str) -> String {
                     "grok-2" => "grok-2",
                     _ => trimmed,
                 },
-                ProviderKind::OpenAi => trimmed,
+                ProviderKind::OpenAi
+                | ProviderKind::Local
+                | ProviderKind::LmStudio
+                | ProviderKind::Ollama => trimmed,
             })
         })
         .map_or_else(|| trimmed.to_string(), ToOwned::to_owned)
@@ -153,6 +159,41 @@ pub fn resolve_model_alias(model: &str) -> String {
 #[must_use]
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     let canonical = resolve_model_alias(model);
+    if let Some(provider) = provider_prefix_for_model(&canonical) {
+        return match provider {
+            "xai" => Some(ProviderMetadata {
+                provider: ProviderKind::Xai,
+                auth_env: "XAI_API_KEY",
+                base_url_env: "XAI_BASE_URL",
+                default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
+            }),
+            "openai" => Some(ProviderMetadata {
+                provider: ProviderKind::OpenAi,
+                auth_env: "OPENAI_API_KEY",
+                base_url_env: "OPENAI_BASE_URL",
+                default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+            }),
+            "local" => Some(ProviderMetadata {
+                provider: ProviderKind::Local,
+                auth_env: "LOCAL_API_KEY",
+                base_url_env: "LOCAL_BASE_URL",
+                default_base_url: openai_compat::DEFAULT_LOCAL_BASE_URL,
+            }),
+            "lmstudio" => Some(ProviderMetadata {
+                provider: ProviderKind::LmStudio,
+                auth_env: "LMSTUDIO_API_KEY",
+                base_url_env: "LMSTUDIO_BASE_URL",
+                default_base_url: openai_compat::DEFAULT_LMSTUDIO_BASE_URL,
+            }),
+            "ollama" => Some(ProviderMetadata {
+                provider: ProviderKind::Ollama,
+                auth_env: "OLLAMA_API_KEY",
+                base_url_env: "OLLAMA_BASE_URL",
+                default_base_url: openai_compat::DEFAULT_OLLAMA_OPENAI_BASE_URL,
+            }),
+            _ => None,
+        };
+    }
     if canonical.starts_with("claude") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Anthropic,
@@ -170,6 +211,46 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
         });
     }
     None
+}
+
+#[must_use]
+pub fn provider_prefix_for_model(model: &str) -> Option<&str> {
+    let (provider, model_id) = model.trim().split_once('/')?;
+    let provider = provider.trim();
+    if provider.is_empty() || model_id.trim().is_empty() {
+        return None;
+    }
+    match provider {
+        "xai" | "openai" | "local" | "lmstudio" | "ollama" => Some(provider),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn model_name_for_provider_request(model: &str, provider: ProviderKind) -> String {
+    let trimmed = model.trim();
+    let Some((prefix, model_id)) = trimmed.split_once('/') else {
+        return resolve_model_alias(trimmed);
+    };
+    let prefix = prefix.trim();
+    let model_id = model_id.trim();
+    let expected_prefix = match provider {
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Xai => "xai",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Local => "local",
+        ProviderKind::LmStudio => "lmstudio",
+        ProviderKind::Ollama => "ollama",
+    };
+    if prefix == expected_prefix && !model_id.is_empty() {
+        if matches!(provider, ProviderKind::Anthropic | ProviderKind::Xai) {
+            resolve_model_alias(model_id)
+        } else {
+            model_id.to_string()
+        }
+    } else {
+        resolve_model_alias(trimmed)
+    }
 }
 
 #[must_use]
@@ -191,6 +272,12 @@ pub fn detect_provider_kind(model: &str) -> ProviderKind {
 
 #[must_use]
 pub fn max_tokens_for_model(model: &str) -> u32 {
+    if matches!(
+        metadata_for_model(model).map(|metadata| metadata.provider),
+        Some(ProviderKind::Local | ProviderKind::LmStudio | ProviderKind::Ollama)
+    ) {
+        return 8_192;
+    }
     model_token_limit(model).map_or_else(
         || {
             let canonical = resolve_model_alias(model);

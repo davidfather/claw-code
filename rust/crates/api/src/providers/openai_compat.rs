@@ -12,10 +12,16 @@ use crate::types::{
     ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
-use super::{preflight_message_request, Provider, ProviderFuture};
+use super::{
+    model_name_for_provider_request, preflight_message_request, Provider, ProviderFuture,
+    ProviderKind,
+};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_LOCAL_BASE_URL: &str = "http://127.0.0.1:1234/v1";
+pub const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
+pub const DEFAULT_OLLAMA_OPENAI_BASE_URL: &str = "http://127.0.0.1:11434/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -24,41 +30,90 @@ const DEFAULT_MAX_RETRIES: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenAiCompatConfig {
+    pub provider_kind: ProviderKind,
     pub provider_name: &'static str,
     pub api_key_env: &'static str,
     pub base_url_env: &'static str,
     pub default_base_url: &'static str,
+    pub auth_required: bool,
 }
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const LOCAL_ENV_VARS: &[&str] = &["LOCAL_API_KEY"];
+const LMSTUDIO_ENV_VARS: &[&str] = &["LMSTUDIO_API_KEY"];
+const OLLAMA_ENV_VARS: &[&str] = &["OLLAMA_API_KEY"];
 
 impl OpenAiCompatConfig {
     #[must_use]
     pub const fn xai() -> Self {
         Self {
+            provider_kind: ProviderKind::Xai,
             provider_name: "xAI",
             api_key_env: "XAI_API_KEY",
             base_url_env: "XAI_BASE_URL",
             default_base_url: DEFAULT_XAI_BASE_URL,
+            auth_required: true,
         }
     }
 
     #[must_use]
     pub const fn openai() -> Self {
         Self {
+            provider_kind: ProviderKind::OpenAi,
             provider_name: "OpenAI",
             api_key_env: "OPENAI_API_KEY",
             base_url_env: "OPENAI_BASE_URL",
             default_base_url: DEFAULT_OPENAI_BASE_URL,
+            auth_required: true,
         }
     }
+
+    #[must_use]
+    pub const fn local() -> Self {
+        Self {
+            provider_kind: ProviderKind::Local,
+            provider_name: "OpenAI-compatible local",
+            api_key_env: "LOCAL_API_KEY",
+            base_url_env: "LOCAL_BASE_URL",
+            default_base_url: DEFAULT_LOCAL_BASE_URL,
+            auth_required: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn lmstudio() -> Self {
+        Self {
+            provider_kind: ProviderKind::LmStudio,
+            provider_name: "LM Studio",
+            api_key_env: "LMSTUDIO_API_KEY",
+            base_url_env: "LMSTUDIO_BASE_URL",
+            default_base_url: DEFAULT_LMSTUDIO_BASE_URL,
+            auth_required: false,
+        }
+    }
+
+    #[must_use]
+    pub const fn ollama() -> Self {
+        Self {
+            provider_kind: ProviderKind::Ollama,
+            provider_name: "Ollama OpenAI-compatible",
+            api_key_env: "OLLAMA_API_KEY",
+            base_url_env: "OLLAMA_BASE_URL",
+            default_base_url: DEFAULT_OLLAMA_OPENAI_BASE_URL,
+            auth_required: false,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
-        match self.provider_name {
-            "xAI" => XAI_ENV_VARS,
-            "OpenAI" => OPENAI_ENV_VARS,
-            _ => &[],
+        match self.provider_kind {
+            ProviderKind::Xai => XAI_ENV_VARS,
+            ProviderKind::OpenAi => OPENAI_ENV_VARS,
+            ProviderKind::Local => LOCAL_ENV_VARS,
+            ProviderKind::LmStudio => LMSTUDIO_ENV_VARS,
+            ProviderKind::Ollama => OLLAMA_ENV_VARS,
+            ProviderKind::Anthropic => &[],
         }
     }
 }
@@ -66,7 +121,7 @@ impl OpenAiCompatConfig {
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatClient {
     http: reqwest::Client,
-    api_key: String,
+    api_key: Option<String>,
     config: OpenAiCompatConfig,
     base_url: String,
     max_retries: u32,
@@ -82,7 +137,20 @@ impl OpenAiCompatClient {
     pub fn new(api_key: impl Into<String>, config: OpenAiCompatConfig) -> Self {
         Self {
             http: reqwest::Client::new(),
-            api_key: api_key.into(),
+            api_key: Some(api_key.into()),
+            config,
+            base_url: read_base_url(config),
+            max_retries: DEFAULT_MAX_RETRIES,
+            initial_backoff: DEFAULT_INITIAL_BACKOFF,
+            max_backoff: DEFAULT_MAX_BACKOFF,
+        }
+    }
+
+    #[must_use]
+    pub fn without_auth(config: OpenAiCompatConfig) -> Self {
+        Self {
+            http: reqwest::Client::new(),
+            api_key: None,
             config,
             base_url: read_base_url(config),
             max_retries: DEFAULT_MAX_RETRIES,
@@ -93,6 +161,9 @@ impl OpenAiCompatClient {
 
     pub fn from_env(config: OpenAiCompatConfig) -> Result<Self, ApiError> {
         let Some(api_key) = read_env_non_empty(config.api_key_env)? else {
+            if !config.auth_required {
+                return Ok(Self::without_auth(config));
+            }
             return Err(ApiError::missing_credentials(
                 config.provider_name,
                 config.credential_env_vars(),
@@ -193,14 +264,18 @@ impl OpenAiCompatClient {
         request: &MessageRequest,
     ) -> Result<reqwest::Response, ApiError> {
         let request_url = chat_completions_endpoint(&self.base_url);
-        self.http
+        let request = self
+            .http
             .post(&request_url)
             .header("content-type", "application/json")
-            .bearer_auth(&self.api_key)
-            .json(&build_chat_completion_request(request, self.config()))
-            .send()
-            .await
-            .map_err(ApiError::from)
+            .json(&build_chat_completion_request(request, self.config()));
+        let request =
+            if let Some(api_key) = self.api_key.as_deref().filter(|value| !value.is_empty()) {
+                request.bearer_auth(api_key)
+            } else {
+                request
+            };
+        request.send().await.map_err(ApiError::from)
     }
 
     fn backoff_for_attempt(&self, attempt: u32) -> Result<Duration, ApiError> {
@@ -653,7 +728,7 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     }
 
     let mut payload = json!({
-        "model": request.model,
+        "model": model_name_for_provider_request(&request.model, config.provider_kind),
         "max_tokens": request.max_tokens,
         "messages": messages,
         "stream": request.stream,
@@ -761,7 +836,7 @@ fn openai_tool_choice(tool_choice: &ToolChoice) -> Value {
 }
 
 fn should_request_stream_usage(config: OpenAiCompatConfig) -> bool {
-    matches!(config.provider_name, "OpenAI")
+    matches!(config.provider_kind, ProviderKind::OpenAi)
 }
 
 fn normalize_response(

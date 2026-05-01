@@ -11,6 +11,9 @@ pub enum ProviderClient {
     Anthropic(AnthropicClient),
     Xai(OpenAiCompatClient),
     OpenAi(OpenAiCompatClient),
+    Local(OpenAiCompatClient),
+    LmStudio(OpenAiCompatClient),
+    Ollama(OpenAiCompatClient),
 }
 
 impl ProviderClient {
@@ -34,6 +37,15 @@ impl ProviderClient {
             ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
                 OpenAiCompatConfig::openai(),
             )?)),
+            ProviderKind::Local => Ok(Self::Local(OpenAiCompatClient::from_env(
+                OpenAiCompatConfig::local(),
+            )?)),
+            ProviderKind::LmStudio => Ok(Self::LmStudio(OpenAiCompatClient::from_env(
+                OpenAiCompatConfig::lmstudio(),
+            )?)),
+            ProviderKind::Ollama => Ok(Self::Ollama(OpenAiCompatClient::from_env(
+                OpenAiCompatConfig::ollama(),
+            )?)),
         }
     }
 
@@ -43,6 +55,9 @@ impl ProviderClient {
             Self::Anthropic(_) => ProviderKind::Anthropic,
             Self::Xai(_) => ProviderKind::Xai,
             Self::OpenAi(_) => ProviderKind::OpenAi,
+            Self::Local(_) => ProviderKind::Local,
+            Self::LmStudio(_) => ProviderKind::LmStudio,
+            Self::Ollama(_) => ProviderKind::Ollama,
         }
     }
 
@@ -50,7 +65,11 @@ impl ProviderClient {
     pub fn with_prompt_cache(self, prompt_cache: PromptCache) -> Self {
         match self {
             Self::Anthropic(client) => Self::Anthropic(client.with_prompt_cache(prompt_cache)),
-            other => other,
+            Self::Xai(client) => Self::Xai(client),
+            Self::OpenAi(client) => Self::OpenAi(client),
+            Self::Local(client) => Self::Local(client),
+            Self::LmStudio(client) => Self::LmStudio(client),
+            Self::Ollama(client) => Self::Ollama(client),
         }
     }
 
@@ -58,7 +77,11 @@ impl ProviderClient {
     pub fn prompt_cache_stats(&self) -> Option<PromptCacheStats> {
         match self {
             Self::Anthropic(client) => client.prompt_cache_stats(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_)
+            | Self::OpenAi(_)
+            | Self::Local(_)
+            | Self::LmStudio(_)
+            | Self::Ollama(_) => None,
         }
     }
 
@@ -66,7 +89,11 @@ impl ProviderClient {
     pub fn take_last_prompt_cache_record(&self) -> Option<PromptCacheRecord> {
         match self {
             Self::Anthropic(client) => client.take_last_prompt_cache_record(),
-            Self::Xai(_) | Self::OpenAi(_) => None,
+            Self::Xai(_)
+            | Self::OpenAi(_)
+            | Self::Local(_)
+            | Self::LmStudio(_)
+            | Self::Ollama(_) => None,
         }
     }
 
@@ -76,7 +103,11 @@ impl ProviderClient {
     ) -> Result<MessageResponse, ApiError> {
         match self {
             Self::Anthropic(client) => client.send_message(request).await,
-            Self::Xai(client) | Self::OpenAi(client) => client.send_message(request).await,
+            Self::Xai(client)
+            | Self::OpenAi(client)
+            | Self::Local(client)
+            | Self::LmStudio(client)
+            | Self::Ollama(client) => client.send_message(request).await,
         }
     }
 
@@ -89,7 +120,11 @@ impl ProviderClient {
                 .stream_message(request)
                 .await
                 .map(MessageStream::Anthropic),
-            Self::Xai(client) | Self::OpenAi(client) => client
+            Self::Xai(client)
+            | Self::OpenAi(client)
+            | Self::Local(client)
+            | Self::LmStudio(client)
+            | Self::Ollama(client) => client
                 .stream_message(request)
                 .await
                 .map(MessageStream::OpenAiCompat),
