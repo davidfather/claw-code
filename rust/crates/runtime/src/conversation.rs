@@ -484,6 +484,47 @@ where
         Ok(summary)
     }
 
+    /// Records a completed non-agent turn that was handled outside the tool loop.
+    ///
+    /// This is used by fast/direct lanes that intentionally skip the system
+    /// prompt, memory, and tool schema, but still need normal session
+    /// persistence and usage reporting semantics.
+    pub fn append_direct_turn(
+        &mut self,
+        user_input: impl Into<String>,
+        mut assistant_message: ConversationMessage,
+        prompt_cache_events: Vec<PromptCacheEvent>,
+    ) -> Result<TurnSummary, RuntimeError> {
+        let user_input = user_input.into();
+        self.record_turn_started(&user_input);
+        self.session
+            .push_user_text(user_input)
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+
+        if assistant_message.usage.is_none() {
+            assistant_message.usage = Some(TokenUsage::default());
+        }
+        let usage = assistant_message.usage.unwrap_or_default();
+        self.usage_tracker.record(usage);
+        self.record_assistant_iteration(1, &assistant_message, 0);
+
+        self.session
+            .push_message(assistant_message.clone())
+            .map_err(|error| RuntimeError::new(error.to_string()))?;
+
+        let auto_compaction = self.maybe_auto_compact();
+        let summary = TurnSummary {
+            assistant_messages: vec![assistant_message],
+            tool_results: Vec::new(),
+            prompt_cache_events,
+            iterations: 1,
+            usage: self.usage_tracker.cumulative_usage(),
+            auto_compaction,
+        };
+        self.record_turn_completed(&summary);
+        Ok(summary)
+    }
+
     #[must_use]
     pub fn compact(&self, config: CompactionConfig) -> CompactionResult {
         compact_session(&self.session, config)
@@ -795,7 +836,7 @@ mod tests {
         PermissionRequest,
     };
     use crate::prompt::{ProjectContext, SystemPromptBuilder};
-    use crate::session::{ContentBlock, MessageRole, Session};
+    use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
     use crate::usage::TokenUsage;
     use crate::ToolError;
     use std::fs;
@@ -871,6 +912,38 @@ mod tests {
             assert_eq!(request.tool_name, "add");
             PermissionPromptDecision::Allow
         }
+    }
+
+    #[test]
+    fn append_direct_turn_records_session_without_api_or_tools() {
+        let api_client = ScriptedApiClient { call_count: 0 };
+        let tool_executor = StaticToolExecutor::new();
+        let mut runtime = ConversationRuntime::new(
+            Session::new(),
+            api_client,
+            tool_executor,
+            PermissionPolicy::new(PermissionMode::WorkspaceWrite),
+            vec!["system prompt should not be sent".to_string()],
+        );
+
+        let summary = runtime
+            .append_direct_turn(
+                "Reply with exactly: pong",
+                ConversationMessage::assistant_with_usage(
+                    vec![ContentBlock::Text {
+                        text: "pong".to_string(),
+                    }],
+                    Some(TokenUsage::default()),
+                ),
+                Vec::new(),
+            )
+            .expect("direct turn should append");
+
+        assert_eq!(summary.iterations, 1);
+        assert_eq!(summary.tool_results, Vec::new());
+        assert_eq!(runtime.session().messages.len(), 2);
+        assert_eq!(runtime.usage().turns(), 1);
+        assert_eq!(runtime.usage().cumulative_usage(), TokenUsage::default());
     }
 
     #[test]

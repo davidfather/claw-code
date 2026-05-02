@@ -146,8 +146,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, true, allowed_tools, permission_mode)?
-            .run_turn_with_output(&prompt, output_format)?,
+        } => run_prompt_with_router(
+            &prompt,
+            model,
+            output_format,
+            allowed_tools,
+            permission_mode,
+        )?,
         CliAction::Login { output_format } => run_login(output_format)?,
         CliAction::Logout { output_format } => run_logout(output_format)?,
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
@@ -2401,6 +2406,117 @@ fn run_repl(
     Ok(())
 }
 
+fn run_prompt_with_router(
+    prompt: &str,
+    model: String,
+    output_format: CliOutputFormat,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let route = route_turn_with_llm(prompt, &model).unwrap_or_else(TurnRoute::router_fallback);
+    match route.mode {
+        TurnMode::DirectFinal => {
+            let answer = route.direct_answer.clone().unwrap_or_default();
+            let summary = persist_standalone_direct_turn(prompt, &answer)?;
+            emit_direct_prompt_output(&summary, &model, output_format, &route)?;
+            Ok(())
+        }
+        TurnMode::DirectLlm => {
+            let summary = run_standalone_direct_llm_turn(prompt, &model, output_format)?;
+            emit_direct_prompt_output(&summary, &model, output_format, &route)?;
+            Ok(())
+        }
+        TurnMode::ContextLlm | TurnMode::ToolAgent | TurnMode::PlanningAgent => {
+            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            match output_format {
+                CliOutputFormat::Text => cli.run_agent_turn(prompt),
+                CliOutputFormat::Json => cli.run_prompt_json(prompt, Some(&route)),
+            }
+        }
+    }
+}
+
+fn persist_standalone_direct_turn(
+    prompt: &str,
+    answer: &str,
+) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+    let assistant_message = ConversationMessage::assistant_with_usage(
+        vec![ContentBlock::Text {
+            text: answer.to_string(),
+        }],
+        Some(TokenUsage::default()),
+    );
+    persist_standalone_direct_message(prompt, assistant_message, Vec::new())
+}
+
+fn run_standalone_direct_llm_turn(
+    prompt: &str,
+    model: &str,
+    output_format: CliOutputFormat,
+) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+    let emit_output = matches!(output_format, CliOutputFormat::Text);
+    let mut client = CliProviderRuntimeClient::new(
+        "direct-prompt",
+        model.to_string(),
+        false,
+        emit_output,
+        None,
+        GlobalToolRegistry::builtin(),
+        None,
+    )?;
+    let events = client.stream(ApiRequest {
+        system_prompt: Vec::new(),
+        messages: vec![ConversationMessage::user_text(prompt)],
+    })?;
+    if emit_output {
+        println!();
+    }
+    let (assistant_message, prompt_cache_events) = direct_message_from_events(events)?;
+    persist_standalone_direct_message(prompt, assistant_message, prompt_cache_events)
+}
+
+fn persist_standalone_direct_message(
+    prompt: &str,
+    mut assistant_message: ConversationMessage,
+    prompt_cache_events: Vec<PromptCacheEvent>,
+) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+    if assistant_message.usage.is_none() {
+        assistant_message.usage = Some(TokenUsage::default());
+    }
+    let usage = assistant_message.usage.unwrap_or_default();
+    let mut session_state = Session::new();
+    let session = create_managed_session_handle(&session_state.session_id)?;
+    session_state = session_state.with_persistence_path(session.path.clone());
+    session_state.push_user_text(prompt)?;
+    session_state.push_message(assistant_message.clone())?;
+
+    Ok(runtime::TurnSummary {
+        assistant_messages: vec![assistant_message],
+        tool_results: Vec::new(),
+        prompt_cache_events,
+        iterations: 1,
+        usage,
+        auto_compaction: None,
+    })
+}
+
+fn emit_direct_prompt_output(
+    summary: &runtime::TurnSummary,
+    model: &str,
+    output_format: CliOutputFormat,
+    route: &TurnRoute,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match output_format {
+        CliOutputFormat::Text => {
+            if matches!(route.mode, TurnMode::DirectFinal) {
+                println!("{}", final_assistant_text(summary));
+            }
+        }
+        CliOutputFormat::Json => print_prompt_json_summary(summary, model, Some(route))?,
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct SessionHandle {
     id: String,
@@ -2424,6 +2540,324 @@ struct LiveCli {
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnMode {
+    DirectFinal,
+    DirectLlm,
+    ContextLlm,
+    ToolAgent,
+    PlanningAgent,
+}
+
+impl TurnMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::DirectFinal => "direct_final",
+            Self::DirectLlm => "direct_llm",
+            Self::ContextLlm => "context_llm",
+            Self::ToolAgent => "tool_agent",
+            Self::PlanningAgent => "planning_agent",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "directfinal" | "direct_final" => Some(Self::DirectFinal),
+            "directllm" | "direct_llm" => Some(Self::DirectLlm),
+            "contextllm" | "context_llm" => Some(Self::ContextLlm),
+            "toolagent" | "tool_agent" => Some(Self::ToolAgent),
+            "planningagent" | "planning_agent" => Some(Self::PlanningAgent),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TurnRoute {
+    mode: TurnMode,
+    needs_system_prompt: bool,
+    needs_memory: bool,
+    needs_session_history: bool,
+    needs_tools: bool,
+    needs_skills: Vec<String>,
+    confidence: f32,
+    reason: String,
+    direct_answer: Option<String>,
+}
+
+impl TurnRoute {
+    fn direct_final(answer: String, reason: impl Into<String>) -> Self {
+        Self {
+            mode: TurnMode::DirectFinal,
+            needs_system_prompt: false,
+            needs_memory: false,
+            needs_session_history: false,
+            needs_tools: false,
+            needs_skills: Vec::new(),
+            confidence: 0.99,
+            reason: reason.into(),
+            direct_answer: Some(answer),
+        }
+    }
+
+    fn direct_llm(reason: impl Into<String>) -> Self {
+        Self {
+            mode: TurnMode::DirectLlm,
+            needs_system_prompt: false,
+            needs_memory: false,
+            needs_session_history: false,
+            needs_tools: false,
+            needs_skills: Vec::new(),
+            confidence: 0.82,
+            reason: reason.into(),
+            direct_answer: None,
+        }
+    }
+
+    fn context_llm(reason: impl Into<String>) -> Self {
+        Self {
+            mode: TurnMode::ContextLlm,
+            needs_system_prompt: true,
+            needs_memory: true,
+            needs_session_history: true,
+            needs_tools: false,
+            needs_skills: Vec::new(),
+            confidence: 0.78,
+            reason: reason.into(),
+            direct_answer: None,
+        }
+    }
+
+    fn tool_agent(reason: impl Into<String>) -> Self {
+        Self {
+            mode: TurnMode::ToolAgent,
+            needs_system_prompt: true,
+            needs_memory: true,
+            needs_session_history: true,
+            needs_tools: true,
+            needs_skills: Vec::new(),
+            confidence: 0.86,
+            reason: reason.into(),
+            direct_answer: None,
+        }
+    }
+
+    fn planning_agent(reason: impl Into<String>) -> Self {
+        Self {
+            mode: TurnMode::PlanningAgent,
+            needs_system_prompt: true,
+            needs_memory: true,
+            needs_session_history: true,
+            needs_tools: true,
+            needs_skills: Vec::new(),
+            confidence: 0.88,
+            reason: reason.into(),
+            direct_answer: None,
+        }
+    }
+
+    fn router_fallback(error: Box<dyn std::error::Error>) -> Self {
+        Self::tool_agent(format!(
+            "router failed; falling back to full agent: {error}"
+        ))
+    }
+
+    fn normalize(mut self) -> Self {
+        match self.mode {
+            TurnMode::DirectFinal | TurnMode::DirectLlm => {
+                self.needs_system_prompt = false;
+                self.needs_memory = false;
+                self.needs_session_history = false;
+                self.needs_tools = false;
+            }
+            TurnMode::ContextLlm => {
+                self.needs_system_prompt = true;
+                self.needs_memory = true;
+                self.needs_session_history = true;
+                self.needs_tools = false;
+            }
+            TurnMode::ToolAgent | TurnMode::PlanningAgent => {
+                self.needs_system_prompt = true;
+                self.needs_memory = true;
+                self.needs_session_history = true;
+                self.needs_tools = true;
+            }
+        }
+        if !matches!(self.mode, TurnMode::DirectFinal) {
+            self.direct_answer = None;
+        }
+        self
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "mode": self.mode.as_str(),
+            "needs_system_prompt": self.needs_system_prompt,
+            "needs_memory": self.needs_memory,
+            "needs_session_history": self.needs_session_history,
+            "needs_tools": self.needs_tools,
+            "needs_skills": self.needs_skills,
+            "confidence": self.confidence,
+            "reason": self.reason,
+        })
+    }
+}
+
+fn route_turn_with_llm(input: &str, model: &str) -> Result<TurnRoute, Box<dyn std::error::Error>> {
+    let router_prompt = build_turn_router_prompt(input);
+    let client = provider_client_for_model(model)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let response = runtime.block_on(client.send_message(&MessageRequest {
+        model: model.to_string(),
+        max_tokens: 512,
+        messages: vec![InputMessage::user_text(router_prompt)],
+        system: None,
+        tools: None,
+        tool_choice: None,
+        stream: false,
+    }))?;
+    let text = response_text(&response);
+    parse_turn_route_response(&text).map_err(Into::into)
+}
+
+fn provider_client_for_model(model: &str) -> Result<ProviderClient, Box<dyn std::error::Error>> {
+    let provider_kind = api::detect_provider_kind(model);
+    if matches!(provider_kind, ProviderKind::Anthropic) {
+        Ok(ProviderClient::from_model_with_anthropic_auth(
+            model,
+            Some(resolve_cli_auth_source()?),
+        )?)
+    } else {
+        Ok(ProviderClient::from_model(model)?)
+    }
+}
+
+fn build_turn_router_prompt(input: &str) -> String {
+    format!(
+        r#"Classify the next user input into exactly one execution mode.
+
+Return JSON only. Do not answer outside JSON.
+
+Modes:
+- DirectFinal: the request can be satisfied by the router itself with an exact or deterministic answer. Include direct_answer.
+- DirectLlm: answerable from the model's general language ability without project context, memory, skills, or tools.
+- ContextLlm: needs prior conversation, project instructions, or memory, but no tools.
+- ToolAgent: needs files, shell, git, workspace inspection, MCP, plugins, skills, or other tools.
+- PlanningAgent: multi-step coding, architecture, verification, commit/push, document editing, or work that needs planning and completion checks.
+
+Schema:
+{{
+  "mode": "DirectFinal|DirectLlm|ContextLlm|ToolAgent|PlanningAgent",
+  "needs_system_prompt": boolean,
+  "needs_memory": boolean,
+  "needs_session_history": boolean,
+  "needs_tools": boolean,
+  "needs_skills": [],
+  "confidence": number,
+  "reason": "short reason",
+  "direct_answer": string|null
+}}
+
+For exact-output requests such as "Reply with exactly: pong", use DirectFinal and set direct_answer to exactly the requested output.
+
+User input:
+<<<
+{input}
+>>>"#
+    )
+}
+
+fn response_text(response: &MessageResponse) -> String {
+    response
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            OutputContentBlock::Text { text } => Some(text.as_str()),
+            OutputContentBlock::ToolUse { .. }
+            | OutputContentBlock::Thinking { .. }
+            | OutputContentBlock::RedactedThinking { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn parse_turn_route_response(text: &str) -> Result<TurnRoute, String> {
+    let json_text = extract_json_object(text)
+        .ok_or_else(|| format!("router response did not contain JSON: {text}"))?;
+    let value: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|error| format!("router response JSON did not parse: {error}: {json_text}"))?;
+    turn_route_from_json(&value)
+}
+
+fn extract_json_object(text: &str) -> Option<&str> {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') {
+        return Some(trimmed);
+    }
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    (start < end).then_some(&trimmed[start..=end])
+}
+
+fn turn_route_from_json(value: &serde_json::Value) -> Result<TurnRoute, String> {
+    let mode = value
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .and_then(TurnMode::parse)
+        .ok_or_else(|| format!("router response has invalid mode: {value}"))?;
+    let needs_skills = value
+        .get("needs_skills")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let route = TurnRoute {
+        mode,
+        needs_system_prompt: value
+            .get("needs_system_prompt")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        needs_memory: value
+            .get("needs_memory")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        needs_session_history: value
+            .get("needs_session_history")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        needs_tools: value
+            .get("needs_tools")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        needs_skills,
+        confidence: value
+            .get("confidence")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.5) as f32,
+        reason: value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("llm router decision")
+            .to_string(),
+        direct_answer: value
+            .get("direct_answer")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned),
+    }
+    .normalize();
+    if matches!(route.mode, TurnMode::DirectFinal)
+        && route.direct_answer.as_deref().unwrap_or("").is_empty()
+    {
+        return Err("DirectFinal route must include direct_answer".to_string());
+    }
+    Ok(route)
 }
 
 struct RuntimePluginState {
@@ -3014,6 +3448,26 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let route =
+            route_turn_with_llm(input, &self.model).unwrap_or_else(TurnRoute::router_fallback);
+        match route.mode {
+            TurnMode::DirectFinal => {
+                let answer = route.direct_answer.clone().unwrap_or_default();
+                println!("{answer}");
+                self.append_direct_answer(input, answer, Vec::new())?;
+                return Ok(());
+            }
+            TurnMode::DirectLlm => {
+                self.run_direct_llm_turn(input, true)?;
+                return Ok(());
+            }
+            TurnMode::ContextLlm | TurnMode::ToolAgent | TurnMode::PlanningAgent => {
+                return self.run_agent_turn(input);
+            }
+        }
+    }
+
+    fn run_agent_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
@@ -3062,11 +3516,84 @@ impl LiveCli {
     ) -> Result<(), Box<dyn std::error::Error>> {
         match output_format {
             CliOutputFormat::Text => self.run_turn(input),
-            CliOutputFormat::Json => self.run_prompt_json(input),
+            CliOutputFormat::Json => {
+                let route = route_turn_with_llm(input, &self.model)
+                    .unwrap_or_else(TurnRoute::router_fallback);
+                match route.mode {
+                    TurnMode::DirectFinal => {
+                        let answer = route.direct_answer.clone().unwrap_or_default();
+                        let summary = self.append_direct_answer(input, answer, Vec::new())?;
+                        print_prompt_json_summary(&summary, &self.model, Some(&route))?;
+                        Ok(())
+                    }
+                    TurnMode::DirectLlm => {
+                        let summary = self.run_direct_llm_turn(input, false)?;
+                        print_prompt_json_summary(&summary, &self.model, Some(&route))?;
+                        Ok(())
+                    }
+                    TurnMode::ContextLlm | TurnMode::ToolAgent | TurnMode::PlanningAgent => {
+                        self.run_prompt_json(input, Some(&route))
+                    }
+                }
+            }
         }
     }
 
-    fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn append_direct_answer(
+        &mut self,
+        input: &str,
+        answer: String,
+        prompt_cache_events: Vec<PromptCacheEvent>,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let assistant_message = ConversationMessage::assistant_with_usage(
+            vec![ContentBlock::Text { text: answer }],
+            Some(TokenUsage::default()),
+        );
+        let summary = self.runtime.append_direct_turn(
+            input.to_string(),
+            assistant_message,
+            prompt_cache_events,
+        )?;
+        self.persist_session()?;
+        Ok(summary)
+    }
+
+    fn run_direct_llm_turn(
+        &mut self,
+        input: &str,
+        emit_output: bool,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let mut client = CliProviderRuntimeClient::new(
+            &self.session.id,
+            self.model.clone(),
+            false,
+            emit_output,
+            None,
+            GlobalToolRegistry::builtin(),
+            None,
+        )?;
+        let events = client.stream(ApiRequest {
+            system_prompt: Vec::new(),
+            messages: vec![ConversationMessage::user_text(input)],
+        })?;
+        if emit_output {
+            println!();
+        }
+        let (assistant_message, prompt_cache_events) = direct_message_from_events(events)?;
+        let summary = self.runtime.append_direct_turn(
+            input.to_string(),
+            assistant_message,
+            prompt_cache_events,
+        )?;
+        self.persist_session()?;
+        Ok(summary)
+    }
+
+    fn run_prompt_json(
+        &mut self,
+        input: &str,
+        route: Option<&TurnRoute>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
@@ -3074,33 +3601,7 @@ impl LiveCli {
         let summary = result?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
-        println!(
-            "{}",
-            json!({
-                "message": final_assistant_text(&summary),
-                "model": self.model,
-                "iterations": summary.iterations,
-                "auto_compaction": summary.auto_compaction.map(|event| json!({
-                    "removed_messages": event.removed_message_count,
-                    "notice": format_auto_compaction_notice(event.removed_message_count),
-                })),
-                "tool_uses": collect_tool_uses(&summary),
-                "tool_results": collect_tool_results(&summary),
-                "prompt_cache_events": collect_prompt_cache_events(&summary),
-                "usage": {
-                    "input_tokens": summary.usage.input_tokens,
-                    "output_tokens": summary.usage.output_tokens,
-                    "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
-                    "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
-                },
-                "estimated_cost": format_usd(
-                    summary.usage.estimate_cost_usd_with_pricing(
-                        pricing_for_model(&self.model)
-                            .unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
-                    ).total_cost_usd()
-                )
-            })
-        );
+        print_prompt_json_summary(&summary, &self.model, route)?;
         Ok(())
     }
 
@@ -5671,6 +6172,88 @@ fn format_user_visible_api_error(session_id: &str, error: &api::ApiError) -> Str
     }
 }
 
+fn print_prompt_json_summary(
+    summary: &runtime::TurnSummary,
+    model: &str,
+    route: Option<&TurnRoute>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut payload = json!({
+        "message": final_assistant_text(summary),
+        "model": model,
+        "iterations": summary.iterations,
+        "auto_compaction": summary.auto_compaction.map(|event| json!({
+            "removed_messages": event.removed_message_count,
+            "notice": format_auto_compaction_notice(event.removed_message_count),
+        })),
+        "tool_uses": collect_tool_uses(summary),
+        "tool_results": collect_tool_results(summary),
+        "prompt_cache_events": collect_prompt_cache_events(summary),
+        "usage": {
+            "input_tokens": summary.usage.input_tokens,
+            "output_tokens": summary.usage.output_tokens,
+            "cache_creation_input_tokens": summary.usage.cache_creation_input_tokens,
+            "cache_read_input_tokens": summary.usage.cache_read_input_tokens,
+        },
+        "estimated_cost": format_usd(
+            summary.usage.estimate_cost_usd_with_pricing(
+                pricing_for_model(model).unwrap_or_else(runtime::ModelPricing::default_sonnet_tier)
+            ).total_cost_usd()
+        )
+    });
+    if let Some(route) = route {
+        payload["turn_route"] = route.to_json();
+    }
+    println!("{payload}");
+    Ok(())
+}
+
+fn direct_message_from_events(
+    events: Vec<AssistantEvent>,
+) -> Result<(ConversationMessage, Vec<PromptCacheEvent>), RuntimeError> {
+    let mut text = String::new();
+    let mut blocks = Vec::new();
+    let mut prompt_cache_events = Vec::new();
+    let mut finished = false;
+    let mut usage = None;
+
+    for event in events {
+        match event {
+            AssistantEvent::TextDelta(delta) => text.push_str(&delta),
+            AssistantEvent::ToolUse { id, name, input } => {
+                flush_direct_text_block(&mut text, &mut blocks);
+                blocks.push(ContentBlock::ToolUse { id, name, input });
+            }
+            AssistantEvent::Usage(value) => usage = Some(value),
+            AssistantEvent::PromptCache(event) => prompt_cache_events.push(event),
+            AssistantEvent::MessageStop => finished = true,
+        }
+    }
+
+    flush_direct_text_block(&mut text, &mut blocks);
+
+    if !finished {
+        return Err(RuntimeError::new(
+            "assistant stream ended without a message stop event",
+        ));
+    }
+    if blocks.is_empty() {
+        return Err(RuntimeError::new("assistant stream produced no content"));
+    }
+
+    Ok((
+        ConversationMessage::assistant_with_usage(blocks, usage),
+        prompt_cache_events,
+    ))
+}
+
+fn flush_direct_text_block(text: &mut String, blocks: &mut Vec<ContentBlock>) {
+    if !text.is_empty() {
+        blocks.push(ContentBlock::Text {
+            text: std::mem::take(text),
+        });
+    }
+}
+
 fn final_assistant_text(summary: &runtime::TurnSummary) -> String {
     summary
         .assistant_messages
@@ -6671,15 +7254,15 @@ mod tests {
         format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         normalize_permission_mode, parse_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
-        print_help_to, push_output_block, render_config_report, render_diff_report,
-        render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_session_reference, response_to_events,
+        parse_git_status_metadata_for, parse_git_workspace_summary, parse_turn_route_response,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_memory_report, render_repl_help,
+        render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        SlashCommand, StatusUsage, DEFAULT_MODEL,
+        SlashCommand, StatusUsage, TurnMode, DEFAULT_MODEL,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -6719,6 +7302,45 @@ mod tests {
             None,
         )])
         .expect("plugin tool registry should build")
+    }
+
+    #[test]
+    fn parses_llm_router_exact_reply_as_direct_final() {
+        let route = parse_turn_route_response(
+            r#"{"mode":"DirectFinal","needs_system_prompt":false,"needs_memory":false,"needs_session_history":false,"needs_tools":false,"needs_skills":[],"confidence":0.99,"reason":"exact output","direct_answer":"pong"}"#,
+        )
+        .expect("router JSON should parse");
+
+        assert_eq!(route.mode, TurnMode::DirectFinal);
+        assert_eq!(route.direct_answer.as_deref(), Some("pong"));
+        assert!(!route.needs_system_prompt);
+        assert!(!route.needs_tools);
+    }
+
+    #[test]
+    fn parses_llm_router_workspace_request_as_tool_agent() {
+        let route = parse_turn_route_response(
+            r#"```json
+{"mode":"ToolAgent","needs_system_prompt":true,"needs_memory":true,"needs_session_history":true,"needs_tools":true,"needs_skills":[],"confidence":0.91,"reason":"needs file access","direct_answer":null}
+```"#,
+        )
+        .expect("router JSON fence should parse");
+
+        assert_eq!(route.mode, TurnMode::ToolAgent);
+        assert!(route.needs_system_prompt);
+        assert!(route.needs_tools);
+    }
+
+    #[test]
+    fn parses_llm_router_implementation_request_as_planning_agent() {
+        let route = parse_turn_route_response(
+            r#"{"mode":"PlanningAgent","needs_system_prompt":true,"needs_memory":true,"needs_session_history":true,"needs_tools":true,"needs_skills":[],"confidence":0.94,"reason":"multi-step implementation","direct_answer":null}"#,
+        )
+        .expect("router JSON should parse");
+
+        assert_eq!(route.mode, TurnMode::PlanningAgent);
+        assert!(route.needs_memory);
+        assert!(route.needs_tools);
     }
 
     #[test]
