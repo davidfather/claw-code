@@ -25,8 +25,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
     oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
-    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient, ProviderKind, ResponseFormat,
+    ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageRequestMetrics,
+    MessageResponse, OutputContentBlock, PromptCache, ProviderClient, ProviderKind, ResponseFormat,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
@@ -2535,7 +2535,9 @@ fn run_prompt_with_router(
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let router_model = models.resolve(ModelRole::Router).to_string();
-    let (route, router_step) = route_turn_with_trace(prompt, &router_model);
+    let telemetry = new_turn_telemetry_recorder();
+    let (route, router_step) =
+        route_turn_with_trace_and_telemetry(prompt, &router_model, Some(&telemetry));
     let mut trace = TurnExecutionTrace::new(route.mode);
     trace.push(router_step);
     match route.mode {
@@ -2543,23 +2545,32 @@ fn run_prompt_with_router(
             let started = Instant::now();
             let answer = route.direct_answer.clone().unwrap_or_default();
             let summary = persist_standalone_direct_turn(prompt, &answer)?;
+            record_turn_summary(&telemetry, &summary);
             trace.push(TurnExecutionStep::turn_mode(
                 route.mode,
                 None,
                 started.elapsed(),
             ));
+            trace.sync_telemetry(&telemetry);
             emit_direct_prompt_output(&summary, &router_model, output_format, &route, &trace)?;
             Ok(())
         }
         TurnMode::DirectLlm => {
             let model = models.resolve(ModelRole::DirectLlm).to_string();
             let started = Instant::now();
-            let summary = run_standalone_direct_llm_turn(prompt, &model, output_format)?;
+            let summary = run_standalone_direct_llm_turn(
+                prompt,
+                &model,
+                output_format,
+                Some(telemetry.clone()),
+            )?;
+            record_turn_summary(&telemetry, &summary);
             trace.push(TurnExecutionStep::turn_mode(
                 route.mode,
                 Some(model.clone()),
                 started.elapsed(),
             ));
+            trace.sync_telemetry(&telemetry);
             emit_direct_prompt_output(&summary, &model, output_format, &route, &trace)?;
             Ok(())
         }
@@ -2577,16 +2588,19 @@ fn run_prompt_with_router(
             match output_format {
                 CliOutputFormat::Text => {
                     let started = Instant::now();
-                    let result = cli.run_agent_turn(prompt, route.mode);
+                    let result = cli.run_agent_turn(prompt, route.mode, Some(telemetry.clone()));
                     trace.push(TurnExecutionStep::turn_mode(
                         route.mode,
                         Some(execution_model),
                         started.elapsed(),
                     ));
+                    trace.sync_telemetry(&telemetry);
                     emit_turn_execution_trace_text(&trace);
                     result
                 }
-                CliOutputFormat::Json => cli.run_prompt_json(prompt, Some(&route), Some(trace)),
+                CliOutputFormat::Json => {
+                    cli.run_prompt_json(prompt, Some(&route), Some(trace), Some(telemetry))
+                }
             }
         }
     }
@@ -2609,9 +2623,10 @@ fn run_standalone_direct_llm_turn(
     prompt: &str,
     model: &str,
     output_format: CliOutputFormat,
+    telemetry: Option<TurnTelemetryRecorder>,
 ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
     let emit_output = matches!(output_format, CliOutputFormat::Text);
-    let mut client = CliProviderRuntimeClient::new(
+    let mut client = CliProviderRuntimeClient::new_with_telemetry(
         "direct-prompt",
         model.to_string(),
         false,
@@ -2619,6 +2634,8 @@ fn run_standalone_direct_llm_turn(
         None,
         GlobalToolRegistry::builtin(),
         None,
+        telemetry,
+        "turn_mode",
     )?;
     let events = client.stream(ApiRequest {
         system_prompt: Vec::new(),
@@ -2799,10 +2816,283 @@ impl TurnExecutionStep {
     }
 }
 
+type TurnTelemetryRecorder = Arc<Mutex<TurnExecutionTelemetry>>;
+
+/// Turn-scoped performance telemetry.
+///
+/// `TurnExecutionStep` answers "which lane ran and how long did the lane take?".
+/// This struct answers the next question: "what made that lane expensive?".
+/// The comments below deliberately mirror the user-facing metric definitions so
+/// the same wording can be lifted into the architecture document later.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct TurnExecutionTelemetry {
+    /// Time spent preparing the runtime before the selected lane can call a
+    /// model: system prompt loading, memory/session assembly, tool registry,
+    /// plugin/MCP setup, and hook wiring. This is distinct from model latency.
+    runtime_prepare_ms: u128,
+    /// Number of model->tool->model cycles in an agent turn.
+    ///
+    /// Runtime `iterations` is the number of model requests in the loop. A
+    /// simple answer has `iterations == 1`, so the tool-loop count is
+    /// `iterations - 1`.
+    tool_loop_count: usize,
+    /// Number of local tool attempts represented by tool result messages.
+    ///
+    /// Denied tool attempts can still produce tool-result messages, so this is
+    /// best read as "tool call attempts observed by the runtime".
+    tool_call_count: usize,
+    /// Per-model-request telemetry. A single turn can have one router request,
+    /// one direct answer request, or multiple agent-loop requests.
+    model_requests: Vec<ModelRequestTelemetry>,
+    /// Reason a cheaper or safer fallback path was used, if any.
+    fallback_reason: Option<String>,
+}
+
+impl TurnExecutionTelemetry {
+    fn record_runtime_prepare(&mut self, elapsed: Duration) {
+        self.runtime_prepare_ms = self.runtime_prepare_ms.saturating_add(elapsed.as_millis());
+    }
+
+    fn record_turn_summary(&mut self, summary: &runtime::TurnSummary) {
+        self.tool_loop_count = summary.iterations.saturating_sub(1);
+        self.tool_call_count = summary.tool_results.len();
+    }
+
+    fn push_request(&mut self, request: ModelRequestTelemetry) {
+        self.model_requests.push(request);
+    }
+
+    fn set_fallback_reason(&mut self, reason: impl Into<String>) {
+        self.fallback_reason = Some(reason.into());
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "runtime_prepare_ms": self.runtime_prepare_ms,
+            "tool_loop_count": self.tool_loop_count,
+            "tool_call_count": self.tool_call_count,
+            "model_requests": self.model_requests.iter().map(ModelRequestTelemetry::to_json).collect::<Vec<_>>(),
+            "fallback_reason": &self.fallback_reason,
+        })
+    }
+
+    fn render_text(&self) -> String {
+        let request_count = self.model_requests.len();
+        let request_bytes = self
+            .model_requests
+            .iter()
+            .map(|request| request.serialized_request_bytes)
+            .sum::<usize>();
+        let estimated_input_tokens = self
+            .model_requests
+            .iter()
+            .map(|request| request.estimated_input_tokens)
+            .sum::<u32>();
+        let tool_schema_bytes = self
+            .model_requests
+            .iter()
+            .map(|request| request.tool_schema_bytes)
+            .sum::<usize>();
+        let tool_count = self
+            .model_requests
+            .iter()
+            .map(|request| request.tool_count)
+            .max()
+            .unwrap_or(0);
+        let first_token = self
+            .model_requests
+            .iter()
+            .find_map(|request| request.first_token_latency_ms)
+            .map_or("-".to_string(), |value| value.to_string());
+        format!(
+            "telemetry runtime_prepare_ms={} requests={} request_bytes={} input_est={} tools={} tool_schema_bytes={} first_token_ms={} tool_loops={} tool_calls={}",
+            self.runtime_prepare_ms,
+            request_count,
+            request_bytes,
+            estimated_input_tokens,
+            tool_count,
+            tool_schema_bytes,
+            first_token,
+            self.tool_loop_count,
+            self.tool_call_count
+        )
+    }
+}
+
+/// Telemetry for one provider request.
+///
+/// `total_latency_ms` is scoped to this one LLM/API request. It is not the same
+/// as turn-level `total_elapsed_ms`, which includes routing, runtime setup,
+/// model calls, tool execution, session persistence, and output formatting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelRequestTelemetry {
+    phase: String,
+    model: String,
+    provider: String,
+    /// Whether this request used streaming. Streaming can expose
+    /// `first_token_latency_ms`; non-stream requests normally cannot because
+    /// the provider returns the full response at once.
+    stream: bool,
+    /// Time to construct the `MessageRequest`, including prompt/tool assembly.
+    request_build_ms: u128,
+    /// Size of the full serialized provider-facing request payload.
+    serialized_request_bytes: usize,
+    /// Locally estimated input tokens before sending the request. This is a
+    /// comparison metric, not provider truth.
+    estimated_input_tokens: u32,
+    /// Requested maximum output tokens (`max_tokens`). This is an upper bound,
+    /// not the actual generated output.
+    requested_output_tokens: u32,
+    /// Number of conversation messages inside this one `MessageRequest`.
+    message_count: usize,
+    /// Raw byte size of the optional system prompt.
+    system_prompt_bytes: usize,
+    /// Number of tools attached to this request.
+    tool_count: usize,
+    /// Total serialized size of the whole tool schema array, not per-tool size.
+    tool_schema_bytes: usize,
+    tool_choice: Option<String>,
+    /// Time from request start to first streamed content chunk. Null for most
+    /// non-stream requests.
+    first_token_latency_ms: Option<u128>,
+    /// Time from request start until this request finished or failed.
+    total_latency_ms: Option<u128>,
+    /// Provider-reported usage after the response. This differs from
+    /// `estimated_input_tokens` because it is measured by the provider and may
+    /// be absent or provider-specific for local LLMs.
+    usage: Option<TokenUsage>,
+    error: Option<String>,
+}
+
+impl ModelRequestTelemetry {
+    fn from_request(
+        phase: impl Into<String>,
+        request: &MessageRequest,
+        provider: ProviderKind,
+        request_build_elapsed: Duration,
+    ) -> Self {
+        let metrics = MessageRequestMetrics::from_request(request);
+        Self {
+            phase: phase.into(),
+            model: request.model.clone(),
+            provider: provider_kind_label(provider).to_string(),
+            stream: metrics.stream,
+            request_build_ms: request_build_elapsed.as_millis(),
+            serialized_request_bytes: metrics.serialized_request_bytes,
+            estimated_input_tokens: metrics.estimated_input_tokens,
+            requested_output_tokens: metrics.requested_output_tokens,
+            message_count: metrics.message_count,
+            system_prompt_bytes: metrics.system_prompt_bytes,
+            tool_count: metrics.tool_count,
+            tool_schema_bytes: metrics.tool_schema_bytes,
+            tool_choice: metrics.tool_choice,
+            first_token_latency_ms: None,
+            total_latency_ms: None,
+            usage: None,
+            error: None,
+        }
+    }
+
+    fn mark_first_token(&mut self, elapsed: Duration) {
+        if self.first_token_latency_ms.is_none() {
+            self.first_token_latency_ms = Some(elapsed.as_millis());
+        }
+    }
+
+    fn finish(&mut self, elapsed: Duration) {
+        self.total_latency_ms = Some(elapsed.as_millis());
+    }
+
+    fn fail(&mut self, elapsed: Duration, error: impl Into<String>) {
+        self.total_latency_ms = Some(elapsed.as_millis());
+        self.error = Some(error.into());
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "phase": &self.phase,
+            "model": &self.model,
+            "provider": &self.provider,
+            "stream": self.stream,
+            "request_build_ms": self.request_build_ms,
+            "serialized_request_bytes": self.serialized_request_bytes,
+            "estimated_input_tokens": self.estimated_input_tokens,
+            "requested_output_tokens": self.requested_output_tokens,
+            "message_count": self.message_count,
+            "system_prompt_bytes": self.system_prompt_bytes,
+            "tool_count": self.tool_count,
+            "tool_schema_bytes": self.tool_schema_bytes,
+            "tool_choice": &self.tool_choice,
+            "first_token_latency_ms": self.first_token_latency_ms,
+            "total_latency_ms": self.total_latency_ms,
+            "usage": self.usage.map(|usage| json!({
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                "cache_read_input_tokens": usage.cache_read_input_tokens,
+            })),
+            "error": &self.error,
+        })
+    }
+}
+
+fn new_turn_telemetry_recorder() -> TurnTelemetryRecorder {
+    Arc::new(Mutex::new(TurnExecutionTelemetry::default()))
+}
+
+fn telemetry_snapshot(recorder: &TurnTelemetryRecorder) -> TurnExecutionTelemetry {
+    recorder
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn record_model_request(recorder: &Option<TurnTelemetryRecorder>, request: ModelRequestTelemetry) {
+    if let Some(recorder) = recorder {
+        recorder
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push_request(request);
+    }
+}
+
+fn record_runtime_prepare(recorder: &TurnTelemetryRecorder, elapsed: Duration) {
+    recorder
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_runtime_prepare(elapsed);
+}
+
+fn record_turn_summary(recorder: &TurnTelemetryRecorder, summary: &runtime::TurnSummary) {
+    recorder
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record_turn_summary(summary);
+}
+
+fn record_fallback_reason(recorder: &TurnTelemetryRecorder, reason: impl Into<String>) {
+    recorder
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_fallback_reason(reason);
+}
+
+fn provider_kind_label(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Xai => "xai",
+        ProviderKind::OpenAi => "openai",
+        ProviderKind::Local => "local",
+        ProviderKind::LmStudio => "lmstudio",
+        ProviderKind::Ollama => "ollama",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TurnExecutionTrace {
     selected_mode: TurnMode,
     steps: Vec<TurnExecutionStep>,
+    telemetry: TurnExecutionTelemetry,
 }
 
 impl TurnExecutionTrace {
@@ -2810,11 +3100,16 @@ impl TurnExecutionTrace {
         Self {
             selected_mode,
             steps: Vec::new(),
+            telemetry: TurnExecutionTelemetry::default(),
         }
     }
 
     fn push(&mut self, step: TurnExecutionStep) {
         self.steps.push(step);
+    }
+
+    fn sync_telemetry(&mut self, recorder: &TurnTelemetryRecorder) {
+        self.telemetry = telemetry_snapshot(recorder);
     }
 
     fn total_elapsed_ms(&self) -> u128 {
@@ -2826,6 +3121,7 @@ impl TurnExecutionTrace {
             "selected_mode": self.selected_mode.as_str(),
             "total_elapsed_ms": self.total_elapsed_ms(),
             "steps": self.steps.iter().map(TurnExecutionStep::to_json).collect::<Vec<_>>(),
+            "telemetry": self.telemetry.to_json(),
         })
     }
 
@@ -2837,10 +3133,11 @@ impl TurnExecutionTrace {
             .collect::<Vec<_>>()
             .join(" | ");
         format!(
-            "turn_execution selected_mode={} total_elapsed_ms={} {}",
+            "turn_execution selected_mode={} total_elapsed_ms={} {} | {}",
             self.selected_mode.as_str(),
             self.total_elapsed_ms(),
-            steps
+            steps,
+            self.telemetry.render_text()
         )
     }
 }
@@ -2985,46 +3282,93 @@ impl TurnRoute {
 struct RouterFailure {
     message: String,
     raw_response: Option<String>,
+    request_telemetry: Option<ModelRequestTelemetry>,
 }
 
-fn route_turn_with_llm(input: &str, model: &str) -> Result<(TurnRoute, String), RouterFailure> {
+fn route_turn_with_llm(
+    input: &str,
+    model: &str,
+) -> Result<(TurnRoute, String, ModelRequestTelemetry), RouterFailure> {
+    let request_build_started = Instant::now();
     let router_prompt = build_turn_router_prompt(input);
-    let client = provider_client_for_model(model).map_err(|error| RouterFailure {
-        message: error.to_string(),
-        raw_response: None,
-    })?;
-    let runtime = tokio::runtime::Runtime::new().map_err(|error| RouterFailure {
-        message: error.to_string(),
-        raw_response: None,
-    })?;
-    let response = runtime
-        .block_on(client.send_message(&MessageRequest {
-            model: model.to_string(),
-            max_tokens: 128,
-            messages: vec![InputMessage::user_text(router_prompt)],
-            system: None,
-            tools: None,
-            tool_choice: None,
-            response_format: Some(ResponseFormat::JsonObject),
-            stream: false,
-        }))
-        .map_err(|error| RouterFailure {
-            message: error.to_string(),
-            raw_response: None,
-        })?;
+    let request = MessageRequest {
+        model: model.to_string(),
+        max_tokens: 128,
+        messages: vec![InputMessage::user_text(router_prompt)],
+        system: None,
+        tools: None,
+        tool_choice: None,
+        response_format: Some(ResponseFormat::JsonObject),
+        stream: false,
+    };
+    let provider_kind = api::detect_provider_kind(model);
+    let mut request_telemetry = ModelRequestTelemetry::from_request(
+        "router",
+        &request,
+        provider_kind,
+        request_build_started.elapsed(),
+    );
+    let client = match provider_client_for_model(model) {
+        Ok(client) => client,
+        Err(error) => {
+            request_telemetry.fail(Duration::ZERO, error.to_string());
+            return Err(RouterFailure {
+                message: error.to_string(),
+                raw_response: None,
+                request_telemetry: Some(request_telemetry),
+            });
+        }
+    };
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            request_telemetry.fail(Duration::ZERO, error.to_string());
+            return Err(RouterFailure {
+                message: error.to_string(),
+                raw_response: None,
+                request_telemetry: Some(request_telemetry),
+            });
+        }
+    };
+    let request_started = Instant::now();
+    let response = match runtime.block_on(client.send_message(&request)) {
+        Ok(response) => response,
+        Err(error) => {
+            request_telemetry.fail(request_started.elapsed(), error.to_string());
+            return Err(RouterFailure {
+                message: error.to_string(),
+                raw_response: None,
+                request_telemetry: Some(request_telemetry),
+            });
+        }
+    };
+    request_telemetry.finish(request_started.elapsed());
+    request_telemetry.usage = Some(response.usage.token_usage());
     let text = response_text(&response);
     parse_turn_route_response(&text)
-        .map(|route| (route, text.clone()))
+        .map(|route| (route, text.clone(), request_telemetry.clone()))
         .map_err(|error| RouterFailure {
             message: error,
             raw_response: Some(text),
+            request_telemetry: Some(request_telemetry),
         })
 }
 
 fn route_turn_with_trace(input: &str, model: &str) -> (TurnRoute, TurnExecutionStep) {
+    route_turn_with_trace_and_telemetry(input, model, None)
+}
+
+fn route_turn_with_trace_and_telemetry(
+    input: &str,
+    model: &str,
+    telemetry: Option<&TurnTelemetryRecorder>,
+) -> (TurnRoute, TurnExecutionStep) {
     let started = Instant::now();
     match route_turn_with_llm(input, model) {
-        Ok((route, raw_response)) => {
+        Ok((route, raw_response, request_telemetry)) => {
+            if let Some(telemetry) = telemetry {
+                record_model_request(&Some(telemetry.clone()), request_telemetry);
+            }
             let step = TurnExecutionStep::router(
                 model.to_string(),
                 started.elapsed(),
@@ -3034,6 +3378,14 @@ fn route_turn_with_trace(input: &str, model: &str) -> (TurnRoute, TurnExecutionS
             (route, step)
         }
         Err(error) => {
+            if let Some(request_telemetry) = error.request_telemetry {
+                if let Some(telemetry) = telemetry {
+                    record_model_request(&Some(telemetry.clone()), request_telemetry);
+                }
+            }
+            if let Some(telemetry) = telemetry {
+                record_fallback_reason(telemetry, error.message.clone());
+            }
             let step = TurnExecutionStep::router(
                 model.to_string(),
                 started.elapsed(),
@@ -3746,8 +4098,19 @@ impl LiveCli {
         emit_output: bool,
         model: &str,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
+        self.prepare_turn_runtime_with_telemetry(emit_output, model, None)
+            .map(|(runtime, monitor, _)| (runtime, monitor))
+    }
+
+    fn prepare_turn_runtime_with_telemetry(
+        &self,
+        emit_output: bool,
+        model: &str,
+        telemetry: Option<TurnTelemetryRecorder>,
+    ) -> Result<(BuiltRuntime, HookAbortMonitor, Duration), Box<dyn std::error::Error>> {
+        let started = Instant::now();
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime(
+        let runtime = build_runtime_with_request_telemetry(
             self.runtime.session().clone(),
             &self.session.id,
             model.to_string(),
@@ -3757,11 +4120,12 @@ impl LiveCli {
             self.allowed_tools.clone(),
             self.permission_mode,
             None,
+            telemetry,
         )?
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
-        Ok((runtime, hook_abort_monitor))
+        Ok((runtime, hook_abort_monitor, started.elapsed()))
     }
 
     fn execution_model_for_mode(&self, mode: TurnMode) -> Option<&str> {
@@ -3776,7 +4140,9 @@ impl LiveCli {
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let router_model = self.models.resolve(ModelRole::Router).to_string();
-        let (route, router_step) = route_turn_with_trace(input, &router_model);
+        let telemetry = new_turn_telemetry_recorder();
+        let (route, router_step) =
+            route_turn_with_trace_and_telemetry(input, &router_model, Some(&telemetry));
         let mut trace = TurnExecutionTrace::new(route.mode);
         trace.push(router_step);
         match route.mode {
@@ -3784,24 +4150,28 @@ impl LiveCli {
                 let started = Instant::now();
                 let answer = route.direct_answer.clone().unwrap_or_default();
                 println!("{answer}");
-                self.append_direct_answer(input, answer, Vec::new())?;
+                let summary = self.append_direct_answer(input, answer, Vec::new())?;
+                record_turn_summary(&telemetry, &summary);
                 trace.push(TurnExecutionStep::turn_mode(
                     route.mode,
                     None,
                     started.elapsed(),
                 ));
+                trace.sync_telemetry(&telemetry);
                 emit_turn_execution_trace_text(&trace);
                 return Ok(());
             }
             TurnMode::DirectLlm => {
                 let model = self.models.resolve(ModelRole::DirectLlm).to_string();
                 let started = Instant::now();
-                self.run_direct_llm_turn(input, true)?;
+                let summary = self.run_direct_llm_turn(input, true, Some(telemetry.clone()))?;
+                record_turn_summary(&telemetry, &summary);
                 trace.push(TurnExecutionStep::turn_mode(
                     route.mode,
                     Some(model),
                     started.elapsed(),
                 ));
+                trace.sync_telemetry(&telemetry);
                 emit_turn_execution_trace_text(&trace);
                 return Ok(());
             }
@@ -3811,12 +4181,13 @@ impl LiveCli {
                     .unwrap_or(self.model.as_str())
                     .to_string();
                 let started = Instant::now();
-                let result = self.run_agent_turn(input, route.mode);
+                let result = self.run_agent_turn(input, route.mode, Some(telemetry.clone()));
                 trace.push(TurnExecutionStep::turn_mode(
                     route.mode,
                     Some(model),
                     started.elapsed(),
                 ));
+                trace.sync_telemetry(&telemetry);
                 emit_turn_execution_trace_text(&trace);
                 return result;
             }
@@ -3827,12 +4198,17 @@ impl LiveCli {
         &mut self,
         input: &str,
         mode: TurnMode,
+        telemetry: Option<TurnTelemetryRecorder>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let model = self
             .execution_model_for_mode(mode)
             .unwrap_or(self.model.as_str())
             .to_string();
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true, &model)?;
+        let (mut runtime, hook_abort_monitor, prepare_elapsed) =
+            self.prepare_turn_runtime_with_telemetry(true, &model, telemetry.clone())?;
+        if let Some(telemetry) = &telemetry {
+            record_runtime_prepare(telemetry, prepare_elapsed);
+        }
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -3845,6 +4221,9 @@ impl LiveCli {
         hook_abort_monitor.stop();
         match result {
             Ok(summary) => {
+                if let Some(telemetry) = &telemetry {
+                    record_turn_summary(telemetry, &summary);
+                }
                 self.replace_runtime(runtime)?;
                 spinner.finish(
                     "✨ Done",
@@ -3882,7 +4261,9 @@ impl LiveCli {
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => {
                 let router_model = self.models.resolve(ModelRole::Router).to_string();
-                let (route, router_step) = route_turn_with_trace(input, &router_model);
+                let telemetry = new_turn_telemetry_recorder();
+                let (route, router_step) =
+                    route_turn_with_trace_and_telemetry(input, &router_model, Some(&telemetry));
                 let mut trace = TurnExecutionTrace::new(route.mode);
                 trace.push(router_step);
                 match route.mode {
@@ -3890,11 +4271,13 @@ impl LiveCli {
                         let started = Instant::now();
                         let answer = route.direct_answer.clone().unwrap_or_default();
                         let summary = self.append_direct_answer(input, answer, Vec::new())?;
+                        record_turn_summary(&telemetry, &summary);
                         trace.push(TurnExecutionStep::turn_mode(
                             route.mode,
                             None,
                             started.elapsed(),
                         ));
+                        trace.sync_telemetry(&telemetry);
                         print_prompt_json_summary(
                             &summary,
                             &router_model,
@@ -3906,17 +4289,20 @@ impl LiveCli {
                     TurnMode::DirectLlm => {
                         let model = self.models.resolve(ModelRole::DirectLlm).to_string();
                         let started = Instant::now();
-                        let summary = self.run_direct_llm_turn(input, false)?;
+                        let summary =
+                            self.run_direct_llm_turn(input, false, Some(telemetry.clone()))?;
+                        record_turn_summary(&telemetry, &summary);
                         trace.push(TurnExecutionStep::turn_mode(
                             route.mode,
                             Some(model.clone()),
                             started.elapsed(),
                         ));
+                        trace.sync_telemetry(&telemetry);
                         print_prompt_json_summary(&summary, &model, Some(&route), Some(&trace))?;
                         Ok(())
                     }
                     TurnMode::ContextLlm | TurnMode::ToolAgent | TurnMode::PlanningAgent => {
-                        self.run_prompt_json(input, Some(&route), Some(trace))
+                        self.run_prompt_json(input, Some(&route), Some(trace), Some(telemetry))
                     }
                 }
             }
@@ -3946,9 +4332,10 @@ impl LiveCli {
         &mut self,
         input: &str,
         emit_output: bool,
+        telemetry: Option<TurnTelemetryRecorder>,
     ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
         let model = self.models.resolve(ModelRole::DirectLlm).to_string();
-        let mut client = CliProviderRuntimeClient::new(
+        let mut client = CliProviderRuntimeClient::new_with_telemetry(
             &self.session.id,
             model,
             false,
@@ -3956,6 +4343,8 @@ impl LiveCli {
             None,
             GlobalToolRegistry::builtin(),
             None,
+            telemetry,
+            "turn_mode",
         )?;
         let events = client.stream(ApiRequest {
             system_prompt: Vec::new(),
@@ -3979,18 +4368,23 @@ impl LiveCli {
         input: &str,
         route: Option<&TurnRoute>,
         trace: Option<TurnExecutionTrace>,
+        telemetry: Option<TurnTelemetryRecorder>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mode = route.map_or(TurnMode::ToolAgent, |route| route.mode);
         let model = self
             .execution_model_for_mode(mode)
             .unwrap_or(self.model.as_str())
             .to_string();
+        let telemetry = telemetry.unwrap_or_else(new_turn_telemetry_recorder);
         let started = Instant::now();
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, &model)?;
+        let (mut runtime, hook_abort_monitor, prepare_elapsed) =
+            self.prepare_turn_runtime_with_telemetry(false, &model, Some(telemetry.clone()))?;
+        record_runtime_prepare(&telemetry, prepare_elapsed);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
+        record_turn_summary(&telemetry, &summary);
         self.replace_runtime(runtime)?;
         self.persist_session()?;
         let mut trace = trace.unwrap_or_else(|| TurnExecutionTrace::new(mode));
@@ -3999,6 +4393,7 @@ impl LiveCli {
             Some(model.clone()),
             started.elapsed(),
         ));
+        trace.sync_telemetry(&telemetry);
         print_prompt_json_summary(&summary, &model, route, Some(&trace))?;
         Ok(())
     }
@@ -6206,8 +6601,7 @@ fn build_runtime(
     permission_mode: PermissionMode,
     progress_reporter: Option<InternalPromptProgressReporter>,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
-    let runtime_plugin_state = build_runtime_plugin_state()?;
-    build_runtime_with_plugin_state(
+    build_runtime_with_request_telemetry(
         session,
         session_id,
         model,
@@ -6217,6 +6611,36 @@ fn build_runtime(
         allowed_tools,
         permission_mode,
         progress_reporter,
+        None,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_with_request_telemetry(
+    session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    telemetry: Option<TurnTelemetryRecorder>,
+) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    let runtime_plugin_state = build_runtime_plugin_state()?;
+    build_runtime_with_plugin_state_and_telemetry(
+        session,
+        session_id,
+        model,
+        system_prompt,
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        permission_mode,
+        progress_reporter,
+        telemetry,
         runtime_plugin_state,
     )
 }
@@ -6235,6 +6659,36 @@ fn build_runtime_with_plugin_state(
     progress_reporter: Option<InternalPromptProgressReporter>,
     runtime_plugin_state: RuntimePluginState,
 ) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    build_runtime_with_plugin_state_and_telemetry(
+        session,
+        session_id,
+        model,
+        system_prompt,
+        enable_tools,
+        emit_output,
+        allowed_tools,
+        permission_mode,
+        progress_reporter,
+        None,
+        runtime_plugin_state,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_with_plugin_state_and_telemetry(
+    session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    enable_tools: bool,
+    emit_output: bool,
+    allowed_tools: Option<AllowedToolSet>,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    telemetry: Option<TurnTelemetryRecorder>,
+    runtime_plugin_state: RuntimePluginState,
+) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
     let RuntimePluginState {
         feature_config,
         tool_registry,
@@ -6246,7 +6700,7 @@ fn build_runtime_with_plugin_state(
         .map_err(std::io::Error::other)?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        CliProviderRuntimeClient::new(
+        CliProviderRuntimeClient::new_with_telemetry(
             session_id,
             model,
             enable_tools,
@@ -6254,6 +6708,8 @@ fn build_runtime_with_plugin_state(
             allowed_tools.clone(),
             tool_registry.clone(),
             progress_reporter,
+            telemetry,
+            "turn_mode",
         )?,
         CliToolExecutor::new(
             allowed_tools.clone(),
@@ -6363,6 +6819,8 @@ struct CliProviderRuntimeClient {
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
+    telemetry: Option<TurnTelemetryRecorder>,
+    telemetry_phase: String,
 }
 
 impl CliProviderRuntimeClient {
@@ -6374,6 +6832,31 @@ impl CliProviderRuntimeClient {
         allowed_tools: Option<AllowedToolSet>,
         tool_registry: GlobalToolRegistry,
         progress_reporter: Option<InternalPromptProgressReporter>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_telemetry(
+            session_id,
+            model,
+            enable_tools,
+            emit_output,
+            allowed_tools,
+            tool_registry,
+            progress_reporter,
+            None,
+            "turn_mode",
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_telemetry(
+        session_id: &str,
+        model: String,
+        enable_tools: bool,
+        emit_output: bool,
+        allowed_tools: Option<AllowedToolSet>,
+        tool_registry: GlobalToolRegistry,
+        progress_reporter: Option<InternalPromptProgressReporter>,
+        telemetry: Option<TurnTelemetryRecorder>,
+        telemetry_phase: impl Into<String>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let provider_kind = api::detect_provider_kind(&model);
         let client = if matches!(provider_kind, ProviderKind::Anthropic) {
@@ -6394,6 +6877,8 @@ impl CliProviderRuntimeClient {
             allowed_tools,
             tool_registry,
             progress_reporter,
+            telemetry,
+            telemetry_phase: telemetry_phase.into(),
         })
     }
 }
@@ -6414,6 +6899,7 @@ impl ApiClient for CliProviderRuntimeClient {
         if let Some(progress_reporter) = &self.progress_reporter {
             progress_reporter.mark_model_phase();
         }
+        let request_build_started = Instant::now();
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: max_tokens_for_model(&self.model),
@@ -6426,15 +6912,30 @@ impl ApiClient for CliProviderRuntimeClient {
             response_format: None,
             stream: true,
         };
+        let request_build_elapsed = request_build_started.elapsed();
+        let provider_kind = self.client.provider_kind();
+        let telemetry = self.telemetry.clone();
+        let telemetry_phase = self.telemetry_phase.clone();
 
         self.runtime.block_on(async {
-            let mut stream =
-                self.client
-                    .stream_message(&message_request)
-                    .await
-                    .map_err(|error| {
-                        RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                    })?;
+            let mut request_telemetry = ModelRequestTelemetry::from_request(
+                telemetry_phase.clone(),
+                &message_request,
+                provider_kind,
+                request_build_elapsed,
+            );
+            let request_started = Instant::now();
+            let mut stream = match self.client.stream_message(&message_request).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    request_telemetry.fail(request_started.elapsed(), error.to_string());
+                    record_model_request(&telemetry, request_telemetry);
+                    return Err(RuntimeError::new(format_user_visible_api_error(
+                        &self.session_id,
+                        &error,
+                    )));
+                }
+            };
             let mut stdout = io::stdout();
             let mut sink = io::sink();
             let out: &mut dyn Write = if self.emit_output {
@@ -6448,16 +6949,29 @@ impl ApiClient for CliProviderRuntimeClient {
             let mut pending_tool: Option<(String, String, String)> = None;
             let mut saw_stop = false;
 
-            while let Some(event) = stream.next_event().await.map_err(|error| {
-                RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-            })? {
+            while let Some(event) = match stream.next_event().await {
+                Ok(event) => event,
+                Err(error) => {
+                    request_telemetry.fail(request_started.elapsed(), error.to_string());
+                    record_model_request(&telemetry, request_telemetry);
+                    return Err(RuntimeError::new(format_user_visible_api_error(
+                        &self.session_id,
+                        &error,
+                    )));
+                }
+            } {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
+                        if !start.message.content.is_empty() {
+                            request_telemetry.mark_first_token(request_started.elapsed());
+                        }
+                        request_telemetry.usage = Some(start.message.usage.token_usage());
                         for block in start.message.content {
                             push_output_block(block, out, &mut events, &mut pending_tool, true)?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
+                        request_telemetry.mark_first_token(request_started.elapsed());
                         push_output_block(
                             start.content_block,
                             out,
@@ -6469,6 +6983,7 @@ impl ApiClient for CliProviderRuntimeClient {
                     ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
                         ContentBlockDelta::TextDelta { text } => {
                             if !text.is_empty() {
+                                request_telemetry.mark_first_token(request_started.elapsed());
                                 if let Some(progress_reporter) = &self.progress_reporter {
                                     progress_reporter.mark_text_phase(&text);
                                 }
@@ -6481,6 +6996,9 @@ impl ApiClient for CliProviderRuntimeClient {
                             }
                         }
                         ContentBlockDelta::InputJsonDelta { partial_json } => {
+                            if !partial_json.is_empty() {
+                                request_telemetry.mark_first_token(request_started.elapsed());
+                            }
                             if let Some((_, _, input)) = &mut pending_tool {
                                 input.push_str(&partial_json);
                             }
@@ -6506,6 +7024,7 @@ impl ApiClient for CliProviderRuntimeClient {
                         }
                     }
                     ApiStreamEvent::MessageDelta(delta) => {
+                        request_telemetry.usage = Some(delta.usage.token_usage());
                         events.push(AssistantEvent::Usage(delta.usage.token_usage()));
                     }
                     ApiStreamEvent::MessageStop(_) => {
@@ -6519,6 +7038,8 @@ impl ApiClient for CliProviderRuntimeClient {
                     }
                 }
             }
+            request_telemetry.finish(request_started.elapsed());
+            record_model_request(&telemetry, request_telemetry);
 
             push_prompt_cache_record(&self.client, &mut events);
 
@@ -6538,16 +7059,32 @@ impl ApiClient for CliProviderRuntimeClient {
                 return Ok(events);
             }
 
-            let response = self
-                .client
-                .send_message(&MessageRequest {
-                    stream: false,
-                    ..message_request.clone()
-                })
-                .await
-                .map_err(|error| {
-                    RuntimeError::new(format_user_visible_api_error(&self.session_id, &error))
-                })?;
+            let fallback_build_started = Instant::now();
+            let fallback_request = MessageRequest {
+                stream: false,
+                ..message_request.clone()
+            };
+            let mut fallback_telemetry = ModelRequestTelemetry::from_request(
+                telemetry_phase,
+                &fallback_request,
+                provider_kind,
+                fallback_build_started.elapsed(),
+            );
+            let fallback_started = Instant::now();
+            let response = match self.client.send_message(&fallback_request).await {
+                Ok(response) => response,
+                Err(error) => {
+                    fallback_telemetry.fail(fallback_started.elapsed(), error.to_string());
+                    record_model_request(&telemetry, fallback_telemetry);
+                    return Err(RuntimeError::new(format_user_visible_api_error(
+                        &self.session_id,
+                        &error,
+                    )));
+                }
+            };
+            fallback_telemetry.finish(fallback_started.elapsed());
+            fallback_telemetry.usage = Some(response.usage.token_usage());
+            record_model_request(&telemetry, fallback_telemetry);
             let mut events = response_to_events(response, out)?;
             push_prompt_cache_record(&self.client, &mut events);
             Ok(events)
@@ -7686,10 +8223,13 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        ModelRole, ModelSelection, SlashCommand, StatusUsage, TurnExecutionStep,
-        TurnExecutionTrace, TurnMode, TurnRoute, DEFAULT_MODEL,
+        ModelRequestTelemetry, ModelRole, ModelSelection, SlashCommand, StatusUsage,
+        TurnExecutionStep, TurnExecutionTrace, TurnMode, TurnRoute, DEFAULT_MODEL,
     };
-    use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
+    use api::{
+        ApiError, InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ToolChoice,
+        ToolDefinition, Usage,
+    };
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
@@ -8147,6 +8687,73 @@ mod tests {
         assert!(rendered.contains("selected_mode=direct_final"));
         assert!(rendered.contains("router mode=- model=ollama/llama3.1:8b elapsed_ms=42"));
         assert!(rendered.contains("turn_mode mode=direct_final model=- elapsed_ms=3"));
+        assert_eq!(
+            payload["telemetry"]["model_requests"]
+                .as_array()
+                .expect("model requests should be an array")
+                .len(),
+            0
+        );
+        assert!(rendered.contains("requests=0"));
+    }
+
+    #[test]
+    fn turn_execution_telemetry_reports_request_payload_and_latency_metrics() {
+        let request = MessageRequest {
+            model: "ollama/llama3.1:8b".to_string(),
+            max_tokens: 128,
+            messages: vec![InputMessage::user_text("Reply with exactly: pong")],
+            system: Some("short system".to_string()),
+            tools: Some(vec![ToolDefinition {
+                name: "read_file".to_string(),
+                description: Some("Read a file".to_string()),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"],
+                    "additionalProperties": false
+                }),
+            }]),
+            tool_choice: Some(ToolChoice::Auto),
+            response_format: None,
+            stream: true,
+        };
+        let mut request_telemetry = ModelRequestTelemetry::from_request(
+            "turn_mode",
+            &request,
+            api::ProviderKind::Ollama,
+            Duration::from_millis(2),
+        );
+        request_telemetry.mark_first_token(Duration::from_millis(15));
+        request_telemetry.finish(Duration::from_millis(50));
+        request_telemetry.usage = Some(runtime::TokenUsage {
+            input_tokens: 11,
+            output_tokens: 1,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        });
+
+        let mut trace = TurnExecutionTrace::new(TurnMode::DirectLlm);
+        trace.telemetry.push_request(request_telemetry);
+
+        let payload = trace.to_json();
+        let request_payload = &payload["telemetry"]["model_requests"][0];
+        assert_eq!(request_payload["phase"], "turn_mode");
+        assert_eq!(request_payload["provider"], "ollama");
+        assert_eq!(request_payload["stream"], true);
+        assert_eq!(request_payload["request_build_ms"], 2);
+        assert_eq!(request_payload["message_count"], 1);
+        assert_eq!(request_payload["system_prompt_bytes"], "short system".len());
+        assert_eq!(request_payload["tool_count"], 1);
+        assert!(request_payload["tool_schema_bytes"].as_u64().unwrap() > 0);
+        assert_eq!(request_payload["tool_choice"], "auto");
+        assert_eq!(request_payload["first_token_latency_ms"], 15);
+        assert_eq!(request_payload["total_latency_ms"], 50);
+        assert_eq!(request_payload["usage"]["input_tokens"], 11);
+        assert_eq!(request_payload["usage"]["output_tokens"], 1);
+        assert!(trace.render_text().contains("first_token_ms=15"));
     }
 
     #[test]

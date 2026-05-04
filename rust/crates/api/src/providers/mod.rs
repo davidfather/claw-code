@@ -2,9 +2,8 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use serde::Serialize;
-
 use crate::error::ApiError;
+use crate::request_metrics::estimate_message_request_input_tokens;
 use crate::types::{MessageRequest, MessageResponse};
 
 pub mod anthropic;
@@ -330,20 +329,6 @@ pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiErro
     }
 
     Ok(())
-}
-
-fn estimate_message_request_input_tokens(request: &MessageRequest) -> u32 {
-    let mut estimate = estimate_serialized_tokens(&request.messages);
-    estimate = estimate.saturating_add(estimate_serialized_tokens(&request.system));
-    estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tools));
-    estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tool_choice));
-    estimate
-}
-
-fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
-    serde_json::to_vec(value)
-        .ok()
-        .map_or(0, |bytes| (bytes.len() / 4 + 1) as u32)
 }
 
 #[cfg(test)]
