@@ -26,8 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, ProviderClient, ProviderKind, StreamEvent as ApiStreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock,
+    OutputContentBlock, PromptCache, ProviderClient, ProviderKind, ResponseFormat,
+    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -74,6 +74,11 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--version",
     "-V",
     "--model",
+    "--router-model",
+    "--direct-llm-model",
+    "--context-llm-model",
+    "--tool-agent-model",
+    "--planning-agent-model",
     "--output-format",
     "--permission-mode",
     "--dangerously-skip-permissions",
@@ -142,13 +147,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Sandbox { output_format } => print_sandbox_status_snapshot(output_format)?,
         CliAction::Prompt {
             prompt,
-            model,
+            models,
             output_format,
             allowed_tools,
             permission_mode,
         } => run_prompt_with_router(
             &prompt,
-            model,
+            models,
             output_format,
             allowed_tools,
             permission_mode,
@@ -158,10 +163,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Repl {
-            model,
+            models,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+        } => run_repl(models, allowed_tools, permission_mode)?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -211,7 +216,7 @@ enum CliAction {
     },
     Prompt {
         prompt: String,
-        model: String,
+        models: ModelSelection,
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
@@ -229,7 +234,7 @@ enum CliAction {
         output_format: CliOutputFormat,
     },
     Repl {
-        model: String,
+        models: ModelSelection,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     },
@@ -265,9 +270,92 @@ impl CliOutputFormat {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelRole {
+    Router,
+    DirectLlm,
+    ContextLlm,
+    ToolAgent,
+    PlanningAgent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelSelection {
+    default_model: String,
+    router_model: Option<String>,
+    direct_llm_model: Option<String>,
+    context_llm_model: Option<String>,
+    tool_agent_model: Option<String>,
+    planning_agent_model: Option<String>,
+}
+
+impl ModelSelection {
+    fn new(default_model: String) -> Self {
+        Self {
+            default_model,
+            router_model: None,
+            direct_llm_model: None,
+            context_llm_model: None,
+            tool_agent_model: None,
+            planning_agent_model: None,
+        }
+    }
+
+    fn default_model(&self) -> &str {
+        &self.default_model
+    }
+
+    fn set_default_model(&mut self, model: String) {
+        self.default_model = model;
+    }
+
+    fn with_default_model(&self, model: String) -> Self {
+        let mut selection = self.clone();
+        selection.default_model = model;
+        selection
+    }
+
+    fn set_role_model(&mut self, role: ModelRole, model: String) {
+        match role {
+            ModelRole::Router => self.router_model = Some(model),
+            ModelRole::DirectLlm => self.direct_llm_model = Some(model),
+            ModelRole::ContextLlm => self.context_llm_model = Some(model),
+            ModelRole::ToolAgent => self.tool_agent_model = Some(model),
+            ModelRole::PlanningAgent => self.planning_agent_model = Some(model),
+        }
+    }
+
+    fn resolve(&self, role: ModelRole) -> &str {
+        let selected = match role {
+            ModelRole::Router => self.router_model.as_deref(),
+            ModelRole::DirectLlm => self.direct_llm_model.as_deref(),
+            ModelRole::ContextLlm => self.context_llm_model.as_deref(),
+            ModelRole::ToolAgent => self.tool_agent_model.as_deref(),
+            ModelRole::PlanningAgent => self.planning_agent_model.as_deref(),
+        };
+        selected.unwrap_or(&self.default_model)
+    }
+
+    fn execution_model_for_mode(&self, mode: TurnMode) -> Option<&str> {
+        match mode {
+            TurnMode::DirectFinal => None,
+            TurnMode::DirectLlm => Some(self.resolve(ModelRole::DirectLlm)),
+            TurnMode::ContextLlm => Some(self.resolve(ModelRole::ContextLlm)),
+            TurnMode::ToolAgent => Some(self.resolve(ModelRole::ToolAgent)),
+            TurnMode::PlanningAgent => Some(self.resolve(ModelRole::PlanningAgent)),
+        }
+    }
+}
+
+impl Default for ModelSelection {
+    fn default() -> Self {
+        Self::new(DEFAULT_MODEL.to_string())
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut models = ModelSelection::default();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -277,6 +365,20 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut index = 0;
 
     while index < args.len() {
+        if let Some(role) = parse_model_role_flag(args[index].as_str()) {
+            let value = args
+                .get(index + 1)
+                .ok_or_else(|| format!("missing value for {}", args[index]))?;
+            models.set_role_model(role, resolve_model_alias(value).to_string());
+            index += 2;
+            continue;
+        }
+        if let Some((role, value)) = parse_model_role_assignment(args[index].as_str()) {
+            models.set_role_model(role, resolve_model_alias(value).to_string());
+            index += 1;
+            continue;
+        }
+
         match args[index].as_str() {
             "--help" | "-h" if rest.is_empty() => {
                 wants_help = true;
@@ -290,11 +392,11 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 let value = args
                     .get(index + 1)
                     .ok_or_else(|| "missing value for --model".to_string())?;
-                model = resolve_model_alias(value).to_string();
+                models.set_default_model(resolve_model_alias(value).to_string());
                 index += 2;
             }
             flag if flag.starts_with("--model=") => {
-                model = resolve_model_alias(&flag[8..]).to_string();
+                models.set_default_model(resolve_model_alias(&flag[8..]).to_string());
                 index += 1;
             }
             "--output-format" => {
@@ -331,7 +433,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 }
                 return Ok(CliAction::Prompt {
                     prompt,
-                    model: resolve_model_alias(&model).to_string(),
+                    models,
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode: permission_mode_override
@@ -390,7 +492,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if rest.is_empty() {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         return Ok(CliAction::Repl {
-            model,
+            models,
             allowed_tools,
             permission_mode,
         });
@@ -401,9 +503,12 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     if let Some(action) = parse_local_help_action(&rest) {
         return action;
     }
-    if let Some(action) =
-        parse_single_word_command_alias(&rest, &model, permission_mode_override, output_format)
-    {
+    if let Some(action) = parse_single_word_command_alias(
+        &rest,
+        models.default_model(),
+        permission_mode_override,
+        output_format,
+    ) {
         return action;
     }
 
@@ -435,7 +540,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             Ok(CliAction::Prompt {
                 prompt,
-                model,
+                models,
                 output_format,
                 allowed_tools,
                 permission_mode,
@@ -444,12 +549,28 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         other if other.starts_with('/') => parse_direct_slash_cli_action(&rest, output_format),
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
-            model,
+            models,
             output_format,
             allowed_tools,
             permission_mode,
         }),
     }
+}
+
+fn parse_model_role_flag(flag: &str) -> Option<ModelRole> {
+    match flag {
+        "--router-model" => Some(ModelRole::Router),
+        "--direct-llm-model" => Some(ModelRole::DirectLlm),
+        "--context-llm-model" => Some(ModelRole::ContextLlm),
+        "--tool-agent-model" => Some(ModelRole::ToolAgent),
+        "--planning-agent-model" => Some(ModelRole::PlanningAgent),
+        _ => None,
+    }
+}
+
+fn parse_model_role_assignment(flag: &str) -> Option<(ModelRole, &str)> {
+    let (name, value) = flag.split_once('=')?;
+    parse_model_role_flag(name).map(|role| (role, value))
 }
 
 fn parse_local_help_action(rest: &[String]) -> Option<Result<CliAction, String>> {
@@ -2358,11 +2479,11 @@ fn run_resume_command(
 }
 
 fn run_repl(
-    model: String,
+    models: ModelSelection,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(models, true, allowed_tools, permission_mode)?;
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -2408,29 +2529,64 @@ fn run_repl(
 
 fn run_prompt_with_router(
     prompt: &str,
-    model: String,
+    models: ModelSelection,
     output_format: CliOutputFormat,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let route = route_turn_with_llm(prompt, &model).unwrap_or_else(TurnRoute::router_fallback);
+    let router_model = models.resolve(ModelRole::Router).to_string();
+    let (route, router_step) = route_turn_with_trace(prompt, &router_model);
+    let mut trace = TurnExecutionTrace::new(route.mode);
+    trace.push(router_step);
     match route.mode {
         TurnMode::DirectFinal => {
+            let started = Instant::now();
             let answer = route.direct_answer.clone().unwrap_or_default();
             let summary = persist_standalone_direct_turn(prompt, &answer)?;
-            emit_direct_prompt_output(&summary, &model, output_format, &route)?;
+            trace.push(TurnExecutionStep::turn_mode(
+                route.mode,
+                None,
+                started.elapsed(),
+            ));
+            emit_direct_prompt_output(&summary, &router_model, output_format, &route, &trace)?;
             Ok(())
         }
         TurnMode::DirectLlm => {
+            let model = models.resolve(ModelRole::DirectLlm).to_string();
+            let started = Instant::now();
             let summary = run_standalone_direct_llm_turn(prompt, &model, output_format)?;
-            emit_direct_prompt_output(&summary, &model, output_format, &route)?;
+            trace.push(TurnExecutionStep::turn_mode(
+                route.mode,
+                Some(model.clone()),
+                started.elapsed(),
+            ));
+            emit_direct_prompt_output(&summary, &model, output_format, &route, &trace)?;
             Ok(())
         }
         TurnMode::ContextLlm | TurnMode::ToolAgent | TurnMode::PlanningAgent => {
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+            let execution_model = models
+                .execution_model_for_mode(route.mode)
+                .unwrap_or(models.default_model())
+                .to_string();
+            let mut cli = LiveCli::new(
+                models.with_default_model(execution_model.clone()),
+                true,
+                allowed_tools,
+                permission_mode,
+            )?;
             match output_format {
-                CliOutputFormat::Text => cli.run_agent_turn(prompt),
-                CliOutputFormat::Json => cli.run_prompt_json(prompt, Some(&route)),
+                CliOutputFormat::Text => {
+                    let started = Instant::now();
+                    let result = cli.run_agent_turn(prompt, route.mode);
+                    trace.push(TurnExecutionStep::turn_mode(
+                        route.mode,
+                        Some(execution_model),
+                        started.elapsed(),
+                    ));
+                    emit_turn_execution_trace_text(&trace);
+                    result
+                }
+                CliOutputFormat::Json => cli.run_prompt_json(prompt, Some(&route), Some(trace)),
             }
         }
     }
@@ -2505,14 +2661,18 @@ fn emit_direct_prompt_output(
     model: &str,
     output_format: CliOutputFormat,
     route: &TurnRoute,
+    trace: &TurnExecutionTrace,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match output_format {
         CliOutputFormat::Text => {
             if matches!(route.mode, TurnMode::DirectFinal) {
                 println!("{}", final_assistant_text(summary));
             }
+            emit_turn_execution_trace_text(trace);
         }
-        CliOutputFormat::Json => print_prompt_json_summary(summary, model, Some(route))?,
+        CliOutputFormat::Json => {
+            print_prompt_json_summary(summary, model, Some(route), Some(trace))?
+        }
     }
     Ok(())
 }
@@ -2535,6 +2695,7 @@ struct ManagedSessionSummary {
 
 struct LiveCli {
     model: String,
+    models: ModelSelection,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     system_prompt: Vec<String>,
@@ -2572,6 +2733,120 @@ impl TurnMode {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnExecutionStep {
+    phase: String,
+    turn_mode: Option<TurnMode>,
+    model: Option<String>,
+    elapsed_ms: u128,
+    error: Option<String>,
+    raw_response: Option<String>,
+}
+
+impl TurnExecutionStep {
+    fn router(
+        model: String,
+        elapsed: Duration,
+        raw_response: Option<String>,
+        error: Option<String>,
+    ) -> Self {
+        Self {
+            phase: "router".to_string(),
+            turn_mode: None,
+            model: Some(model),
+            elapsed_ms: elapsed.as_millis(),
+            error,
+            raw_response,
+        }
+    }
+
+    fn turn_mode(mode: TurnMode, model: Option<String>, elapsed: Duration) -> Self {
+        Self {
+            phase: "turn_mode".to_string(),
+            turn_mode: Some(mode),
+            model,
+            elapsed_ms: elapsed.as_millis(),
+            error: None,
+            raw_response: None,
+        }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "phase": &self.phase,
+            "turn_mode": self.turn_mode.map(TurnMode::as_str),
+            "model": &self.model,
+            "elapsed_ms": self.elapsed_ms,
+            "error": &self.error,
+            "raw_response": &self.raw_response,
+        })
+    }
+
+    fn render_text(&self) -> String {
+        let mode = self.turn_mode.map_or("-", TurnMode::as_str);
+        let model = self.model.as_deref().unwrap_or("-");
+        let mut rendered = format!(
+            "{} mode={} model={} elapsed_ms={}",
+            self.phase, mode, model, self.elapsed_ms
+        );
+        if let Some(error) = &self.error {
+            rendered.push_str(" error=");
+            rendered.push_str(&truncate_for_summary(error, 180));
+        }
+        rendered
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TurnExecutionTrace {
+    selected_mode: TurnMode,
+    steps: Vec<TurnExecutionStep>,
+}
+
+impl TurnExecutionTrace {
+    fn new(selected_mode: TurnMode) -> Self {
+        Self {
+            selected_mode,
+            steps: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, step: TurnExecutionStep) {
+        self.steps.push(step);
+    }
+
+    fn total_elapsed_ms(&self) -> u128 {
+        self.steps.iter().map(|step| step.elapsed_ms).sum()
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "selected_mode": self.selected_mode.as_str(),
+            "total_elapsed_ms": self.total_elapsed_ms(),
+            "steps": self.steps.iter().map(TurnExecutionStep::to_json).collect::<Vec<_>>(),
+        })
+    }
+
+    fn render_text(&self) -> String {
+        let steps = self
+            .steps
+            .iter()
+            .map(TurnExecutionStep::render_text)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        format!(
+            "turn_execution selected_mode={} total_elapsed_ms={} {}",
+            self.selected_mode.as_str(),
+            self.total_elapsed_ms(),
+            steps
+        )
+    }
+}
+
+fn emit_turn_execution_trace_text(trace: &TurnExecutionTrace) {
+    eprintln!("{}", trace.render_text());
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2658,9 +2933,10 @@ impl TurnRoute {
         }
     }
 
-    fn router_fallback(error: Box<dyn std::error::Error>) -> Self {
-        Self::tool_agent(format!(
-            "router failed; falling back to full agent: {error}"
+    fn router_no_tools_fallback(reason: impl Into<String>) -> Self {
+        Self::direct_llm(format!(
+            "router failed; falling back to no-tools DirectLlm: {}",
+            reason.into()
         ))
     }
 
@@ -2705,21 +2981,68 @@ impl TurnRoute {
     }
 }
 
-fn route_turn_with_llm(input: &str, model: &str) -> Result<TurnRoute, Box<dyn std::error::Error>> {
+#[derive(Debug, Clone)]
+struct RouterFailure {
+    message: String,
+    raw_response: Option<String>,
+}
+
+fn route_turn_with_llm(input: &str, model: &str) -> Result<(TurnRoute, String), RouterFailure> {
     let router_prompt = build_turn_router_prompt(input);
-    let client = provider_client_for_model(model)?;
-    let runtime = tokio::runtime::Runtime::new()?;
-    let response = runtime.block_on(client.send_message(&MessageRequest {
-        model: model.to_string(),
-        max_tokens: 512,
-        messages: vec![InputMessage::user_text(router_prompt)],
-        system: None,
-        tools: None,
-        tool_choice: None,
-        stream: false,
-    }))?;
+    let client = provider_client_for_model(model).map_err(|error| RouterFailure {
+        message: error.to_string(),
+        raw_response: None,
+    })?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|error| RouterFailure {
+        message: error.to_string(),
+        raw_response: None,
+    })?;
+    let response = runtime
+        .block_on(client.send_message(&MessageRequest {
+            model: model.to_string(),
+            max_tokens: 128,
+            messages: vec![InputMessage::user_text(router_prompt)],
+            system: None,
+            tools: None,
+            tool_choice: None,
+            response_format: Some(ResponseFormat::JsonObject),
+            stream: false,
+        }))
+        .map_err(|error| RouterFailure {
+            message: error.to_string(),
+            raw_response: None,
+        })?;
     let text = response_text(&response);
-    parse_turn_route_response(&text).map_err(Into::into)
+    parse_turn_route_response(&text)
+        .map(|route| (route, text.clone()))
+        .map_err(|error| RouterFailure {
+            message: error,
+            raw_response: Some(text),
+        })
+}
+
+fn route_turn_with_trace(input: &str, model: &str) -> (TurnRoute, TurnExecutionStep) {
+    let started = Instant::now();
+    match route_turn_with_llm(input, model) {
+        Ok((route, raw_response)) => {
+            let step = TurnExecutionStep::router(
+                model.to_string(),
+                started.elapsed(),
+                Some(raw_response),
+                None,
+            );
+            (route, step)
+        }
+        Err(error) => {
+            let step = TurnExecutionStep::router(
+                model.to_string(),
+                started.elapsed(),
+                error.raw_response.clone(),
+                Some(error.message.clone()),
+            );
+            (TurnRoute::router_no_tools_fallback(error.message), step)
+        }
+    }
 }
 
 fn provider_client_for_model(model: &str) -> Result<ProviderClient, Box<dyn std::error::Error>> {
@@ -2736,36 +3059,24 @@ fn provider_client_for_model(model: &str) -> Result<ProviderClient, Box<dyn std:
 
 fn build_turn_router_prompt(input: &str) -> String {
     format!(
-        r#"Classify the next user input into exactly one execution mode.
+        r#"Return one JSON object only. No markdown. No quoted JSON string.
 
-Return JSON only. Do not answer outside JSON.
-
+Keys: mode, direct_answer, reason.
+Rules:
+- Exact-text requests MUST use DirectFinal with the exact direct_answer.
+- DirectLlm/ContextLlm/ToolAgent/PlanningAgent MUST use direct_answer:null.
 Modes:
-- DirectFinal: the request can be satisfied by the router itself with an exact or deterministic answer. Include direct_answer.
-- DirectLlm: answerable from the model's general language ability without project context, memory, skills, or tools.
-- ContextLlm: needs prior conversation, project instructions, or memory, but no tools.
-- ToolAgent: needs files, shell, git, workspace inspection, MCP, plugins, skills, or other tools.
-- PlanningAgent: multi-step coding, architecture, verification, commit/push, document editing, or work that needs planning and completion checks.
+- DirectFinal: exact deterministic reply; direct_answer is required.
+- DirectLlm: general answer, no context or tools.
+- ContextLlm: needs memory/session/system prompt, no tools.
+- ToolAgent: needs files, shell, git, or tools.
+- PlanningAgent: multi-step coding, verification, commits, docs, or planning.
 
-Schema:
-{{
-  "mode": "DirectFinal|DirectLlm|ContextLlm|ToolAgent|PlanningAgent",
-  "needs_system_prompt": boolean,
-  "needs_memory": boolean,
-  "needs_session_history": boolean,
-  "needs_tools": boolean,
-  "needs_skills": [],
-  "confidence": number,
-  "reason": "short reason",
-  "direct_answer": string|null
-}}
-
-For exact-output requests such as "Reply with exactly: pong", use DirectFinal and set direct_answer to exactly the requested output.
+If the user says "Reply with exactly: X", use:
+{{"mode":"DirectFinal","direct_answer":"X","reason":"exact output"}}
 
 User input:
-<<<
-{input}
->>>"#
+{input}"#
     )
 }
 
@@ -2784,6 +3095,15 @@ fn response_text(response: &MessageResponse) -> String {
 }
 
 fn parse_turn_route_response(text: &str) -> Result<TurnRoute, String> {
+    let trimmed = text.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return match value {
+            serde_json::Value::Object(_) => turn_route_from_json(&value),
+            serde_json::Value::String(inner) => parse_turn_route_response(&inner),
+            other => Err(format!("router response JSON was not an object: {other}")),
+        };
+    }
+
     let json_text = extract_json_object(text)
         .ok_or_else(|| format!("router response did not contain JSON: {text}"))?;
     let value: serde_json::Value = serde_json::from_str(json_text)
@@ -3333,7 +3653,7 @@ impl HookAbortMonitor {
 
 impl LiveCli {
     fn new(
-        model: String,
+        models: ModelSelection,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
@@ -3341,6 +3661,7 @@ impl LiveCli {
         let system_prompt = build_system_prompt()?;
         let session_state = Session::new();
         let session = create_managed_session_handle(&session_state.session_id)?;
+        let model = models.default_model().to_string();
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
             &session.id,
@@ -3354,6 +3675,7 @@ impl LiveCli {
         )?;
         let cli = Self {
             model,
+            models,
             allowed_tools,
             permission_mode,
             system_prompt,
@@ -3422,12 +3744,13 @@ impl LiveCli {
     fn prepare_turn_runtime(
         &self,
         emit_output: bool,
+        model: &str,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
         let hook_abort_signal = runtime::HookAbortSignal::new();
         let runtime = build_runtime(
             self.runtime.session().clone(),
             &self.session.id,
-            self.model.clone(),
+            model.to_string(),
             self.system_prompt.clone(),
             true,
             emit_output,
@@ -3441,6 +3764,10 @@ impl LiveCli {
         Ok((runtime, hook_abort_monitor))
     }
 
+    fn execution_model_for_mode(&self, mode: TurnMode) -> Option<&str> {
+        self.models.execution_model_for_mode(mode)
+    }
+
     fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.shutdown_plugins()?;
         self.runtime = runtime;
@@ -3448,27 +3775,64 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let route =
-            route_turn_with_llm(input, &self.model).unwrap_or_else(TurnRoute::router_fallback);
+        let router_model = self.models.resolve(ModelRole::Router).to_string();
+        let (route, router_step) = route_turn_with_trace(input, &router_model);
+        let mut trace = TurnExecutionTrace::new(route.mode);
+        trace.push(router_step);
         match route.mode {
             TurnMode::DirectFinal => {
+                let started = Instant::now();
                 let answer = route.direct_answer.clone().unwrap_or_default();
                 println!("{answer}");
                 self.append_direct_answer(input, answer, Vec::new())?;
+                trace.push(TurnExecutionStep::turn_mode(
+                    route.mode,
+                    None,
+                    started.elapsed(),
+                ));
+                emit_turn_execution_trace_text(&trace);
                 return Ok(());
             }
             TurnMode::DirectLlm => {
+                let model = self.models.resolve(ModelRole::DirectLlm).to_string();
+                let started = Instant::now();
                 self.run_direct_llm_turn(input, true)?;
+                trace.push(TurnExecutionStep::turn_mode(
+                    route.mode,
+                    Some(model),
+                    started.elapsed(),
+                ));
+                emit_turn_execution_trace_text(&trace);
                 return Ok(());
             }
             TurnMode::ContextLlm | TurnMode::ToolAgent | TurnMode::PlanningAgent => {
-                return self.run_agent_turn(input);
+                let model = self
+                    .execution_model_for_mode(route.mode)
+                    .unwrap_or(self.model.as_str())
+                    .to_string();
+                let started = Instant::now();
+                let result = self.run_agent_turn(input, route.mode);
+                trace.push(TurnExecutionStep::turn_mode(
+                    route.mode,
+                    Some(model),
+                    started.elapsed(),
+                ));
+                emit_turn_execution_trace_text(&trace);
+                return result;
             }
         }
     }
 
-    fn run_agent_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true)?;
+    fn run_agent_turn(
+        &mut self,
+        input: &str,
+        mode: TurnMode,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let model = self
+            .execution_model_for_mode(mode)
+            .unwrap_or(self.model.as_str())
+            .to_string();
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(true, &model)?;
         let mut spinner = Spinner::new();
         let mut stdout = io::stdout();
         spinner.tick(
@@ -3517,22 +3881,42 @@ impl LiveCli {
         match output_format {
             CliOutputFormat::Text => self.run_turn(input),
             CliOutputFormat::Json => {
-                let route = route_turn_with_llm(input, &self.model)
-                    .unwrap_or_else(TurnRoute::router_fallback);
+                let router_model = self.models.resolve(ModelRole::Router).to_string();
+                let (route, router_step) = route_turn_with_trace(input, &router_model);
+                let mut trace = TurnExecutionTrace::new(route.mode);
+                trace.push(router_step);
                 match route.mode {
                     TurnMode::DirectFinal => {
+                        let started = Instant::now();
                         let answer = route.direct_answer.clone().unwrap_or_default();
                         let summary = self.append_direct_answer(input, answer, Vec::new())?;
-                        print_prompt_json_summary(&summary, &self.model, Some(&route))?;
+                        trace.push(TurnExecutionStep::turn_mode(
+                            route.mode,
+                            None,
+                            started.elapsed(),
+                        ));
+                        print_prompt_json_summary(
+                            &summary,
+                            &router_model,
+                            Some(&route),
+                            Some(&trace),
+                        )?;
                         Ok(())
                     }
                     TurnMode::DirectLlm => {
+                        let model = self.models.resolve(ModelRole::DirectLlm).to_string();
+                        let started = Instant::now();
                         let summary = self.run_direct_llm_turn(input, false)?;
-                        print_prompt_json_summary(&summary, &self.model, Some(&route))?;
+                        trace.push(TurnExecutionStep::turn_mode(
+                            route.mode,
+                            Some(model.clone()),
+                            started.elapsed(),
+                        ));
+                        print_prompt_json_summary(&summary, &model, Some(&route), Some(&trace))?;
                         Ok(())
                     }
                     TurnMode::ContextLlm | TurnMode::ToolAgent | TurnMode::PlanningAgent => {
-                        self.run_prompt_json(input, Some(&route))
+                        self.run_prompt_json(input, Some(&route), Some(trace))
                     }
                 }
             }
@@ -3563,9 +3947,10 @@ impl LiveCli {
         input: &str,
         emit_output: bool,
     ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        let model = self.models.resolve(ModelRole::DirectLlm).to_string();
         let mut client = CliProviderRuntimeClient::new(
             &self.session.id,
-            self.model.clone(),
+            model,
             false,
             emit_output,
             None,
@@ -3593,15 +3978,28 @@ impl LiveCli {
         &mut self,
         input: &str,
         route: Option<&TurnRoute>,
+        trace: Option<TurnExecutionTrace>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
+        let mode = route.map_or(TurnMode::ToolAgent, |route| route.mode);
+        let model = self
+            .execution_model_for_mode(mode)
+            .unwrap_or(self.model.as_str())
+            .to_string();
+        let started = Instant::now();
+        let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false, &model)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
         self.replace_runtime(runtime)?;
         self.persist_session()?;
-        print_prompt_json_summary(&summary, &self.model, route)?;
+        let mut trace = trace.unwrap_or_else(|| TurnExecutionTrace::new(mode));
+        trace.push(TurnExecutionStep::turn_mode(
+            mode,
+            Some(model.clone()),
+            started.elapsed(),
+        ));
+        print_prompt_json_summary(&summary, &model, route, Some(&trace))?;
         Ok(())
     }
 
@@ -3844,6 +4242,7 @@ impl LiveCli {
         )?;
         self.replace_runtime(runtime)?;
         self.model.clone_from(&model);
+        self.models.set_default_model(model.clone());
         println!(
             "{}",
             format_model_switch_report(&previous, &model, message_count)
@@ -6024,6 +6423,7 @@ impl ApiClient for CliProviderRuntimeClient {
                 .enable_tools
                 .then(|| filter_tool_specs(&self.tool_registry, self.allowed_tools.as_ref())),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
+            response_format: None,
             stream: true,
         };
 
@@ -6176,6 +6576,7 @@ fn print_prompt_json_summary(
     summary: &runtime::TurnSummary,
     model: &str,
     route: Option<&TurnRoute>,
+    trace: Option<&TurnExecutionTrace>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut payload = json!({
         "message": final_assistant_text(summary),
@@ -6202,6 +6603,9 @@ fn print_prompt_json_summary(
     });
     if let Some(route) = route {
         payload["turn_route"] = route.to_json();
+    }
+    if let Some(trace) = trace {
+        payload["turn_execution"] = trace.to_json();
     }
     println!("{payload}");
     Ok(())
@@ -7104,17 +7508,17 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Usage:")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+        "  claw [--model MODEL] [--router-model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
+        "  claw [--model MODEL] [--router-model MODEL] [--output-format text|json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] TEXT"
+        "  claw [--model MODEL] [--router-model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
@@ -7154,7 +7558,27 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Flags:")?;
     writeln!(
         out,
-        "  --model MODEL              Override the active model"
+        "  --model MODEL              Default model for any unspecified turn-mode model"
+    )?;
+    writeln!(
+        out,
+        "  --router-model MODEL       Model used only to classify the turn mode"
+    )?;
+    writeln!(
+        out,
+        "  --direct-llm-model MODEL   Model for DirectLlm turns"
+    )?;
+    writeln!(
+        out,
+        "  --context-llm-model MODEL  Model for ContextLlm turns"
+    )?;
+    writeln!(
+        out,
+        "  --tool-agent-model MODEL   Model for ToolAgent turns"
+    )?;
+    writeln!(
+        out,
+        "  --planning-agent-model MODEL  Model for PlanningAgent turns"
     )?;
     writeln!(
         out,
@@ -7262,7 +7686,8 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        SlashCommand, StatusUsage, TurnMode, DEFAULT_MODEL,
+        ModelRole, ModelSelection, SlashCommand, StatusUsage, TurnExecutionStep,
+        TurnExecutionTrace, TurnMode, TurnRoute, DEFAULT_MODEL,
     };
     use api::{ApiError, MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -7315,6 +7740,29 @@ mod tests {
         assert_eq!(route.direct_answer.as_deref(), Some("pong"));
         assert!(!route.needs_system_prompt);
         assert!(!route.needs_tools);
+    }
+
+    #[test]
+    fn parses_llm_router_quoted_json_string_response() {
+        let route = parse_turn_route_response(
+            r#""{\"mode\":\"DirectFinal\",\"direct_answer\":\"pong\",\"reason\":\"exact output\"}""#,
+        )
+        .expect("quoted JSON router response should parse");
+
+        assert_eq!(route.mode, TurnMode::DirectFinal);
+        assert_eq!(route.direct_answer.as_deref(), Some("pong"));
+    }
+
+    #[test]
+    fn router_failure_fallback_uses_no_tools_lane() {
+        let route = TurnRoute::router_no_tools_fallback("invalid router JSON");
+
+        assert_eq!(route.mode, TurnMode::DirectLlm);
+        assert!(!route.needs_system_prompt);
+        assert!(!route.needs_memory);
+        assert!(!route.needs_session_history);
+        assert!(!route.needs_tools);
+        assert!(route.reason.contains("no-tools DirectLlm"));
     }
 
     #[test]
@@ -7481,7 +7929,7 @@ mod tests {
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
             CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
+                models: ModelSelection::default(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
             }
@@ -7569,7 +8017,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "hello world".to_string(),
-                model: DEFAULT_MODEL.to_string(),
+                models: ModelSelection::default(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -7592,7 +8040,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "claude-opus".to_string(),
+                models: ModelSelection::new("claude-opus".to_string()),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -7614,12 +8062,91 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
-                model: "claude-opus-4-6".to_string(),
+                models: ModelSelection::new("claude-opus-4-6".to_string()),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
             }
         );
+    }
+
+    #[test]
+    fn parses_turn_mode_model_overrides() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--router-model".to_string(),
+            "ollama/qwen2.5:0.5b".to_string(),
+            "--direct-llm-model=ollama/llama3.2:3b".to_string(),
+            "--context-llm-model".to_string(),
+            "sonnet".to_string(),
+            "--tool-agent-model=ollama/llama3.1:8b".to_string(),
+            "--planning-agent-model".to_string(),
+            "haiku".to_string(),
+            "explain".to_string(),
+            "this".to_string(),
+        ];
+        let action = parse_args(&args).expect("args should parse");
+
+        let CliAction::Prompt { models, .. } = action else {
+            panic!("expected prompt action");
+        };
+
+        assert_eq!(models.default_model(), "claude-opus-4-6");
+        assert_eq!(models.resolve(ModelRole::Router), "ollama/qwen2.5:0.5b");
+        assert_eq!(models.resolve(ModelRole::DirectLlm), "ollama/llama3.2:3b");
+        assert_eq!(models.resolve(ModelRole::ContextLlm), "claude-sonnet-4-6");
+        assert_eq!(models.resolve(ModelRole::ToolAgent), "ollama/llama3.1:8b");
+        assert_eq!(
+            models.resolve(ModelRole::PlanningAgent),
+            "claude-haiku-4-5-20251213"
+        );
+        assert_eq!(models.execution_model_for_mode(TurnMode::DirectFinal), None);
+    }
+
+    #[test]
+    fn turn_mode_model_overrides_fall_back_to_default_model() {
+        let models = ModelSelection::new("ollama/llama3.1:8b".to_string());
+
+        assert_eq!(models.resolve(ModelRole::Router), "ollama/llama3.1:8b");
+        assert_eq!(models.resolve(ModelRole::DirectLlm), "ollama/llama3.1:8b");
+        assert_eq!(models.execution_model_for_mode(TurnMode::DirectFinal), None);
+        assert_eq!(
+            models.execution_model_for_mode(TurnMode::ToolAgent),
+            Some("ollama/llama3.1:8b")
+        );
+    }
+
+    #[test]
+    fn turn_execution_trace_reports_router_and_selected_mode_timing() {
+        let mut trace = TurnExecutionTrace::new(TurnMode::DirectFinal);
+        trace.push(TurnExecutionStep::router(
+            "ollama/llama3.1:8b".to_string(),
+            Duration::from_millis(42),
+            Some(r#"{"mode":"DirectFinal","direct_answer":"pong"}"#.to_string()),
+            None,
+        ));
+        trace.push(TurnExecutionStep::turn_mode(
+            TurnMode::DirectFinal,
+            None,
+            Duration::from_millis(3),
+        ));
+
+        let payload = trace.to_json();
+        assert_eq!(payload["selected_mode"], "direct_final");
+        assert_eq!(payload["total_elapsed_ms"], 45);
+        assert_eq!(payload["steps"][0]["phase"], "router");
+        assert_eq!(payload["steps"][0]["model"], "ollama/llama3.1:8b");
+        assert_eq!(payload["steps"][0]["elapsed_ms"], 42);
+        assert_eq!(payload["steps"][1]["turn_mode"], "direct_final");
+        assert!(payload["steps"][1]["model"].is_null());
+
+        let rendered = trace.render_text();
+        assert!(rendered.contains("selected_mode=direct_final"));
+        assert!(rendered.contains("router mode=- model=ollama/llama3.1:8b elapsed_ms=42"));
+        assert!(rendered.contains("turn_mode mode=direct_final model=- elapsed_ms=3"));
     }
 
     #[test]
@@ -7652,7 +8179,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
+                models: ModelSelection::default(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
             }
@@ -7671,7 +8198,7 @@ mod tests {
         assert_eq!(
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
-                model: DEFAULT_MODEL.to_string(),
+                models: ModelSelection::default(),
                 allowed_tools: Some(
                     ["glob_search", "read_file", "write_file"]
                         .into_iter()
@@ -7857,7 +8384,7 @@ mod tests {
                 .expect("prompt shorthand should still work"),
             CliAction::Prompt {
                 prompt: "help me debug".to_string(),
-                model: DEFAULT_MODEL.to_string(),
+                models: ModelSelection::default(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -8155,7 +8682,7 @@ mod tests {
 
         let banner = with_current_dir(&root, || {
             LiveCli::new(
-                "claude-sonnet-4-6".to_string(),
+                ModelSelection::new("claude-sonnet-4-6".to_string()),
                 true,
                 None,
                 PermissionMode::DangerFullAccess,

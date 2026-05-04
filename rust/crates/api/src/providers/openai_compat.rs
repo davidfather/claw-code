@@ -8,8 +8,8 @@ use crate::error::ApiError;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
-    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
-    ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
+    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, ResponseFormat,
+    StreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
 use super::{
@@ -781,6 +781,9 @@ fn build_chat_completion_request(request: &MessageRequest, config: OpenAiCompatC
     if let Some(tool_choice) = &request.tool_choice {
         payload["tool_choice"] = openai_tool_choice(tool_choice);
     }
+    if let Some(ResponseFormat::JsonObject) = request.response_format {
+        payload["response_format"] = json!({ "type": "json_object" });
+    }
 
     payload
 }
@@ -1126,8 +1129,8 @@ mod tests {
     };
     use crate::error::ApiError;
     use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, ToolChoice, ToolDefinition,
-        ToolResultContentBlock,
+        InputContentBlock, InputMessage, MessageRequest, ResponseFormat, ToolChoice,
+        ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
@@ -1160,6 +1163,7 @@ mod tests {
                     input_schema: json!({"type": "object"}),
                 }]),
                 tool_choice: Some(ToolChoice::Auto),
+                response_format: Some(ResponseFormat::JsonObject),
                 stream: false,
             },
             OpenAiCompatConfig::xai(),
@@ -1170,6 +1174,7 @@ mod tests {
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
         assert_eq!(payload["tool_choice"], json!("auto"));
+        assert_eq!(payload["response_format"], json!({"type": "json_object"}));
     }
 
     #[test]
@@ -1182,6 +1187,7 @@ mod tests {
                 system: None,
                 tools: None,
                 tool_choice: None,
+                response_format: None,
                 stream: true,
             },
             OpenAiCompatConfig::openai(),
@@ -1200,6 +1206,7 @@ mod tests {
                 system: None,
                 tools: None,
                 tool_choice: None,
+                response_format: None,
                 stream: true,
             },
             OpenAiCompatConfig::xai(),

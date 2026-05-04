@@ -8,8 +8,8 @@ use crate::error::ApiError;
 use crate::types::{
     ContentBlockDelta, ContentBlockDeltaEvent, ContentBlockStartEvent, ContentBlockStopEvent,
     InputContentBlock, InputMessage, MessageDelta, MessageDeltaEvent, MessageRequest,
-    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, StreamEvent,
-    ToolDefinition, ToolResultContentBlock, Usage,
+    MessageResponse, MessageStartEvent, MessageStopEvent, OutputContentBlock, ResponseFormat,
+    StreamEvent, ToolDefinition, ToolResultContentBlock, Usage,
 };
 
 use super::{
@@ -429,6 +429,8 @@ struct OllamaChatRequest {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OllamaTool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<OllamaOptions>,
 }
 
@@ -509,6 +511,9 @@ fn build_chat_request(request: &MessageRequest) -> OllamaChatRequest {
         messages: translate_messages(&request.messages, request.system.as_deref()),
         stream: request.stream,
         tools,
+        format: request.response_format.and_then(|format| match format {
+            ResponseFormat::JsonObject => Some("json"),
+        }),
         options: (request.max_tokens > 0).then_some(OllamaOptions {
             num_predict: request.max_tokens,
         }),
@@ -750,8 +755,8 @@ mod tests {
         OllamaToolCallFunction,
     };
     use crate::types::{
-        InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, ToolDefinition,
-        ToolResultContentBlock,
+        InputContentBlock, InputMessage, MessageRequest, OutputContentBlock, ResponseFormat,
+        ToolDefinition, ToolResultContentBlock,
     };
     use serde_json::json;
 
@@ -782,6 +787,7 @@ mod tests {
                 input_schema: json!({"type": "object"}),
             }]),
             tool_choice: None,
+            response_format: Some(ResponseFormat::JsonObject),
             stream: false,
         }))
         .expect("serialize ollama payload");
@@ -791,6 +797,7 @@ mod tests {
         assert_eq!(payload["messages"][1]["role"], json!("user"));
         assert_eq!(payload["messages"][2]["role"], json!("tool"));
         assert_eq!(payload["tools"][0]["type"], json!("function"));
+        assert_eq!(payload["format"], json!("json"));
         assert_eq!(payload["options"]["num_predict"], json!(64));
     }
 

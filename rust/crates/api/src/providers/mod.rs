@@ -419,6 +419,7 @@ mod tests {
                 }),
             }]),
             tool_choice: Some(ToolChoice::Auto),
+            response_format: None,
             stream: true,
         };
 
@@ -457,6 +458,7 @@ mod tests {
             system: None,
             tools: None,
             tool_choice: None,
+            response_format: None,
             stream: false,
         };
 

@@ -703,6 +703,7 @@ mod tests {
             system: Some("system".to_string()),
             tools: None,
             tool_choice: None,
+            response_format: None,
             stream: false,
         }
     }

@@ -1163,6 +1163,7 @@ mod tests {
             system: None,
             tools: None,
             tool_choice: None,
+            response_format: None,
             stream: false,
         };
 

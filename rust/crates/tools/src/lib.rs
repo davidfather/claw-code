@@ -3527,6 +3527,7 @@ impl ApiClient for ProviderRuntimeClient {
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: (!tools.is_empty()).then_some(tools),
             tool_choice: (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto),
+            response_format: None,
             stream: true,
         };
 

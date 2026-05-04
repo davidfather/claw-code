@@ -87,6 +87,7 @@ async fn send_message_blocks_oversized_xai_requests_before_the_http_call() {
             system: Some("Keep the answer short.".to_string()),
             tools: None,
             tool_choice: None,
+            response_format: None,
             stream: false,
         })
         .await
@@ -536,6 +537,7 @@ fn sample_request(stream: bool) -> MessageRequest {
             }),
         }]),
         tool_choice: Some(ToolChoice::Auto),
+        response_format: None,
         stream,
     }
 }
