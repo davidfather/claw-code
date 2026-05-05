@@ -2715,9 +2715,26 @@ struct LiveCli {
     models: ModelSelection,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
-    system_prompt: Vec<String>,
-    runtime: BuiltRuntime,
+    system_prompt: Option<Vec<String>>,
+    runtime: Option<BuiltRuntime>,
+    session_state: Session,
     session: SessionHandle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeBuildKind {
+    Context,
+    FullAgent,
+}
+
+impl RuntimeBuildKind {
+    const fn for_turn_mode(mode: TurnMode) -> Self {
+        match mode {
+            TurnMode::ContextLlm => Self::Context,
+            TurnMode::ToolAgent | TurnMode::PlanningAgent => Self::FullAgent,
+            TurnMode::DirectFinal | TurnMode::DirectLlm => Self::Context,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3569,6 +3586,18 @@ impl BuiltRuntime {
         }
     }
 
+    fn new_minimal(
+        runtime: ConversationRuntime<CliProviderRuntimeClient, CliToolExecutor>,
+    ) -> Self {
+        Self {
+            runtime: Some(runtime),
+            plugin_registry: PluginRegistry::default(),
+            plugins_active: false,
+            mcp_state: None,
+            mcp_active: false,
+        }
+    }
+
     fn with_hook_abort_signal(mut self, hook_abort_signal: runtime::HookAbortSignal) -> Self {
         let runtime = self
             .runtime
@@ -4006,36 +4035,50 @@ impl HookAbortMonitor {
 impl LiveCli {
     fn new(
         models: ModelSelection,
-        enable_tools: bool,
+        _enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let system_prompt = build_system_prompt()?;
         let session_state = Session::new();
         let session = create_managed_session_handle(&session_state.session_id)?;
         let model = models.default_model().to_string();
-        let runtime = build_runtime(
-            session_state.with_persistence_path(session.path.clone()),
-            &session.id,
-            model.clone(),
-            system_prompt.clone(),
-            enable_tools,
-            true,
-            allowed_tools.clone(),
-            permission_mode,
-            None,
-        )?;
+        let session_state = session_state.with_persistence_path(session.path.clone());
         let cli = Self {
             model,
             models,
             allowed_tools,
             permission_mode,
-            system_prompt,
-            runtime,
+            system_prompt: None,
+            runtime: None,
+            session_state,
             session,
         };
         cli.persist_session()?;
         Ok(cli)
+    }
+
+    fn system_prompt(&mut self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        if self.system_prompt.is_none() {
+            self.system_prompt = Some(build_system_prompt()?);
+        }
+        Ok(self.system_prompt.clone().unwrap_or_default())
+    }
+
+    fn invalidate_runtime(&mut self) {
+        self.runtime.take();
+    }
+
+    fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(mut existing) = self.runtime.take() {
+            existing.shutdown_plugins()?;
+        }
+        self.session_state = runtime.session().clone();
+        self.runtime = Some(runtime);
+        Ok(())
+    }
+
+    fn current_usage(&self) -> UsageTracker {
+        UsageTracker::from_session(&self.session_state)
     }
 
     fn startup_banner(&self) -> String {
@@ -4094,34 +4137,54 @@ impl LiveCli {
     }
 
     fn prepare_turn_runtime(
-        &self,
+        &mut self,
         emit_output: bool,
         model: &str,
     ) -> Result<(BuiltRuntime, HookAbortMonitor), Box<dyn std::error::Error>> {
-        self.prepare_turn_runtime_with_telemetry(emit_output, model, None)
-            .map(|(runtime, monitor, _)| (runtime, monitor))
+        self.prepare_turn_runtime_with_telemetry(
+            emit_output,
+            model,
+            RuntimeBuildKind::FullAgent,
+            None,
+        )
+        .map(|(runtime, monitor, _)| (runtime, monitor))
     }
 
     fn prepare_turn_runtime_with_telemetry(
-        &self,
+        &mut self,
         emit_output: bool,
         model: &str,
+        kind: RuntimeBuildKind,
         telemetry: Option<TurnTelemetryRecorder>,
     ) -> Result<(BuiltRuntime, HookAbortMonitor, Duration), Box<dyn std::error::Error>> {
         let started = Instant::now();
         let hook_abort_signal = runtime::HookAbortSignal::new();
-        let runtime = build_runtime_with_request_telemetry(
-            self.runtime.session().clone(),
-            &self.session.id,
-            model.to_string(),
-            self.system_prompt.clone(),
-            true,
-            emit_output,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-            telemetry,
-        )?
+        let session = self.session_state.clone();
+        let system_prompt = self.system_prompt()?;
+        let runtime = match kind {
+            RuntimeBuildKind::Context => build_context_runtime_with_request_telemetry(
+                session,
+                &self.session.id,
+                model.to_string(),
+                system_prompt,
+                emit_output,
+                self.permission_mode,
+                None,
+                telemetry,
+            )?,
+            RuntimeBuildKind::FullAgent => build_runtime_with_request_telemetry(
+                session,
+                &self.session.id,
+                model.to_string(),
+                system_prompt,
+                true,
+                emit_output,
+                self.allowed_tools.clone(),
+                self.permission_mode,
+                None,
+                telemetry,
+            )?,
+        }
         .with_hook_abort_signal(hook_abort_signal.clone());
         let hook_abort_monitor = HookAbortMonitor::spawn(hook_abort_signal);
 
@@ -4130,12 +4193,6 @@ impl LiveCli {
 
     fn execution_model_for_mode(&self, mode: TurnMode) -> Option<&str> {
         self.models.execution_model_for_mode(mode)
-    }
-
-    fn replace_runtime(&mut self, runtime: BuiltRuntime) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.shutdown_plugins()?;
-        self.runtime = runtime;
-        Ok(())
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -4204,8 +4261,9 @@ impl LiveCli {
             .execution_model_for_mode(mode)
             .unwrap_or(self.model.as_str())
             .to_string();
-        let (mut runtime, hook_abort_monitor, prepare_elapsed) =
-            self.prepare_turn_runtime_with_telemetry(true, &model, telemetry.clone())?;
+        let runtime_kind = RuntimeBuildKind::for_turn_mode(mode);
+        let (mut runtime, hook_abort_monitor, prepare_elapsed) = self
+            .prepare_turn_runtime_with_telemetry(true, &model, runtime_kind, telemetry.clone())?;
         if let Some(telemetry) = &telemetry {
             record_runtime_prepare(telemetry, prepare_elapsed);
         }
@@ -4319,13 +4377,7 @@ impl LiveCli {
             vec![ContentBlock::Text { text: answer }],
             Some(TokenUsage::default()),
         );
-        let summary = self.runtime.append_direct_turn(
-            input.to_string(),
-            assistant_message,
-            prompt_cache_events,
-        )?;
-        self.persist_session()?;
-        Ok(summary)
+        self.append_direct_message(input, assistant_message, prompt_cache_events)
     }
 
     fn run_direct_llm_turn(
@@ -4354,13 +4406,30 @@ impl LiveCli {
             println!();
         }
         let (assistant_message, prompt_cache_events) = direct_message_from_events(events)?;
-        let summary = self.runtime.append_direct_turn(
-            input.to_string(),
-            assistant_message,
-            prompt_cache_events,
-        )?;
+        self.append_direct_message(input, assistant_message, prompt_cache_events)
+    }
+
+    fn append_direct_message(
+        &mut self,
+        input: &str,
+        mut assistant_message: ConversationMessage,
+        prompt_cache_events: Vec<PromptCacheEvent>,
+    ) -> Result<runtime::TurnSummary, Box<dyn std::error::Error>> {
+        self.session_state.push_user_text(input.to_string())?;
+        if assistant_message.usage.is_none() {
+            assistant_message.usage = Some(TokenUsage::default());
+        }
+        self.session_state.push_message(assistant_message.clone())?;
+        self.invalidate_runtime();
         self.persist_session()?;
-        Ok(summary)
+        Ok(runtime::TurnSummary {
+            assistant_messages: vec![assistant_message],
+            tool_results: Vec::new(),
+            prompt_cache_events,
+            iterations: 1,
+            usage: self.current_usage().cumulative_usage(),
+            auto_compaction: None,
+        })
     }
 
     fn run_prompt_json(
@@ -4377,8 +4446,14 @@ impl LiveCli {
             .to_string();
         let telemetry = telemetry.unwrap_or_else(new_turn_telemetry_recorder);
         let started = Instant::now();
-        let (mut runtime, hook_abort_monitor, prepare_elapsed) =
-            self.prepare_turn_runtime_with_telemetry(false, &model, Some(telemetry.clone()))?;
+        let runtime_kind = RuntimeBuildKind::for_turn_mode(mode);
+        let (mut runtime, hook_abort_monitor, prepare_elapsed) = self
+            .prepare_turn_runtime_with_telemetry(
+                false,
+                &model,
+                runtime_kind,
+                Some(telemetry.clone()),
+            )?;
         record_runtime_prepare(&telemetry, prepare_elapsed);
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
@@ -4558,23 +4633,24 @@ impl LiveCli {
     }
 
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.runtime.session().save_to_path(&self.session.path)?;
+        self.session_state.save_to_path(&self.session.path)?;
         Ok(())
     }
 
     fn print_status(&self) {
-        let cumulative = self.runtime.usage().cumulative_usage();
-        let latest = self.runtime.usage().current_turn_usage();
+        let usage = self.current_usage();
+        let cumulative = usage.cumulative_usage();
+        let latest = usage.current_turn_usage();
         println!(
             "{}",
             format_status_report(
                 &self.model,
                 StatusUsage {
-                    message_count: self.runtime.session().messages.len(),
-                    turns: self.runtime.usage().turns(),
+                    message_count: self.session_state.messages.len(),
+                    turns: usage.turns(),
                     latest,
                     cumulative,
-                    estimated_tokens: self.runtime.estimated_tokens(),
+                    estimated_tokens: runtime::estimate_session_tokens(&self.session_state),
                 },
                 self.permission_mode.as_str(),
                 &status_context(Some(&self.session.path)).expect("status context should load"),
@@ -4596,12 +4672,13 @@ impl LiveCli {
 
     fn set_model(&mut self, model: Option<String>) -> Result<bool, Box<dyn std::error::Error>> {
         let Some(model) = model else {
+            let usage = self.current_usage();
             println!(
                 "{}",
                 format_model_report(
                     &self.model,
-                    self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
+                    self.session_state.messages.len(),
+                    usage.turns(),
                 )
             );
             return Ok(false);
@@ -4610,32 +4687,21 @@ impl LiveCli {
         let model = resolve_model_alias(&model).to_string();
 
         if model == self.model {
+            let usage = self.current_usage();
             println!(
                 "{}",
                 format_model_report(
                     &self.model,
-                    self.runtime.session().messages.len(),
-                    self.runtime.usage().turns(),
+                    self.session_state.messages.len(),
+                    usage.turns(),
                 )
             );
             return Ok(false);
         }
 
         let previous = self.model.clone();
-        let session = self.runtime.session().clone();
-        let message_count = session.messages.len();
-        let runtime = build_runtime(
-            session,
-            &self.session.id,
-            model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
+        let message_count = self.session_state.messages.len();
+        self.invalidate_runtime();
         self.model.clone_from(&model);
         self.models.set_default_model(model.clone());
         println!(
@@ -4669,20 +4735,8 @@ impl LiveCli {
         }
 
         let previous = self.permission_mode.as_str().to_string();
-        let session = self.runtime.session().clone();
         self.permission_mode = permission_mode_from_label(normalized);
-        let runtime = build_runtime(
-            session,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
+        self.invalidate_runtime();
         println!(
             "{}",
             format_permissions_switch_report(&previous, normalized)
@@ -4701,18 +4755,9 @@ impl LiveCli {
         let previous_session = self.session.clone();
         let session_state = Session::new();
         self.session = create_managed_session_handle(&session_state.session_id)?;
-        let runtime = build_runtime(
-            session_state.with_persistence_path(self.session.path.clone()),
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
+        self.session_state = session_state.with_persistence_path(self.session.path.clone());
+        self.invalidate_runtime();
+        self.persist_session()?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Previous session {}\n  Resume previous  /resume {}\n  Preserved model  {}\n  Permission mode  {}\n  New session      {}\n  Session file     {}",
             previous_session.id,
@@ -4726,7 +4771,7 @@ impl LiveCli {
     }
 
     fn print_cost(&self) {
-        let cumulative = self.runtime.usage().cumulative_usage();
+        let cumulative = self.current_usage().cumulative_usage();
         println!("{}", format_cost_report(cumulative));
     }
 
@@ -4743,18 +4788,9 @@ impl LiveCli {
         let session = Session::load_from_path(&handle.path)?;
         let message_count = session.messages.len();
         let session_id = session.session_id.clone();
-        let runtime = build_runtime(
-            session,
-            &handle.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
+        let turns = UsageTracker::from_session(&session).turns();
+        self.session_state = session;
+        self.invalidate_runtime();
         self.session = SessionHandle {
             id: session_id,
             path: handle.path,
@@ -4764,7 +4800,7 @@ impl LiveCli {
             format_resume_report(
                 &self.session.path.display().to_string(),
                 message_count,
-                self.runtime.usage().turns(),
+                turns,
             )
         );
         Ok(true)
@@ -4838,12 +4874,12 @@ impl LiveCli {
         &self,
         requested_path: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let export_path = resolve_export_path(requested_path, self.runtime.session())?;
-        fs::write(&export_path, render_export_text(self.runtime.session()))?;
+        let export_path = resolve_export_path(requested_path, &self.session_state)?;
+        fs::write(&export_path, render_export_text(&self.session_state))?;
         println!(
             "Export\n  Result           wrote transcript\n  File             {}\n  Messages         {}",
             export_path.display(),
-            self.runtime.session().messages.len(),
+            self.session_state.messages.len(),
         );
         Ok(())
     }
@@ -4867,18 +4903,8 @@ impl LiveCli {
                 let session = Session::load_from_path(&handle.path)?;
                 let message_count = session.messages.len();
                 let session_id = session.session_id.clone();
-                let runtime = build_runtime(
-                    session,
-                    &handle.id,
-                    self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
-                    true,
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    None,
-                )?;
-                self.replace_runtime(runtime)?;
+                self.session_state = session;
+                self.invalidate_runtime();
                 self.session = SessionHandle {
                     id: session_id,
                     path: handle.path,
@@ -4892,7 +4918,7 @@ impl LiveCli {
                 Ok(true)
             }
             Some("fork") => {
-                let forked = self.runtime.fork_session(target.map(ToOwned::to_owned));
+                let forked = self.session_state.fork(target.map(ToOwned::to_owned));
                 let parent_session_id = self.session.id.clone();
                 let handle = create_managed_session_handle(&forked.session_id)?;
                 let branch_name = forked
@@ -4902,18 +4928,8 @@ impl LiveCli {
                 let forked = forked.with_persistence_path(handle.path.clone());
                 let message_count = forked.messages.len();
                 forked.save_to_path(&handle.path)?;
-                let runtime = build_runtime(
-                    forked,
-                    &handle.id,
-                    self.model.clone(),
-                    self.system_prompt.clone(),
-                    true,
-                    true,
-                    self.allowed_tools.clone(),
-                    self.permission_mode,
-                    None,
-                )?;
-                self.replace_runtime(runtime)?;
+                self.session_state = forked;
+                self.invalidate_runtime();
                 self.session = handle;
                 println!(
                     "Session forked\n  Parent session   {}\n  Active session   {}\n  Branch           {}\n  File             {}\n  Messages         {}",
@@ -4952,61 +4968,54 @@ impl LiveCli {
     }
 
     fn reload_runtime_features(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let runtime = build_runtime(
-            self.runtime.session().clone(),
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
+        self.invalidate_runtime();
         self.persist_session()
     }
 
     fn compact(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let result = self.runtime.compact(CompactionConfig::default());
+        let result = runtime::compact_session(&self.session_state, CompactionConfig::default());
         let removed = result.removed_message_count;
         let kept = result.compacted_session.messages.len();
         let skipped = removed == 0;
-        let runtime = build_runtime(
-            result.compacted_session,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            true,
-            true,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            None,
-        )?;
-        self.replace_runtime(runtime)?;
+        self.session_state = result.compacted_session;
+        self.invalidate_runtime();
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
         Ok(())
     }
 
     fn run_internal_prompt_text_with_progress(
-        &self,
+        &mut self,
         prompt: &str,
         enable_tools: bool,
         progress: Option<InternalPromptProgressReporter>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let session = self.runtime.session().clone();
-        let mut runtime = build_runtime(
-            session,
-            &self.session.id,
-            self.model.clone(),
-            self.system_prompt.clone(),
-            enable_tools,
-            false,
-            self.allowed_tools.clone(),
-            self.permission_mode,
-            progress,
-        )?;
+        let session = self.session_state.clone();
+        let system_prompt = self.system_prompt()?;
+        let mut runtime = if enable_tools {
+            build_runtime(
+                session,
+                &self.session.id,
+                self.model.clone(),
+                system_prompt,
+                true,
+                false,
+                self.allowed_tools.clone(),
+                self.permission_mode,
+                progress,
+            )?
+        } else {
+            build_context_runtime_with_request_telemetry(
+                session,
+                &self.session.id,
+                self.model.clone(),
+                system_prompt,
+                false,
+                self.permission_mode,
+                progress,
+                None,
+            )?
+        };
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
         let text = final_assistant_text(&summary).trim().to_string();
@@ -5015,7 +5024,7 @@ impl LiveCli {
     }
 
     fn run_internal_prompt_text(
-        &self,
+        &mut self,
         prompt: &str,
         enable_tools: bool,
     ) -> Result<String, Box<dyn std::error::Error>> {
@@ -5044,7 +5053,7 @@ impl LiveCli {
 
     fn run_debug_tool_call(&self, args: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         validate_no_args("/debug-tool-call", args)?;
-        println!("{}", render_last_tool_debug_report(self.runtime.session())?);
+        println!("{}", render_last_tool_debug_report(&self.session_state)?);
         Ok(())
     }
 
@@ -6643,6 +6652,46 @@ fn build_runtime_with_request_telemetry(
         telemetry,
         runtime_plugin_state,
     )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_arguments)]
+fn build_context_runtime_with_request_telemetry(
+    session: Session,
+    session_id: &str,
+    model: String,
+    system_prompt: Vec<String>,
+    emit_output: bool,
+    permission_mode: PermissionMode,
+    progress_reporter: Option<InternalPromptProgressReporter>,
+    telemetry: Option<TurnTelemetryRecorder>,
+) -> Result<BuiltRuntime, Box<dyn std::error::Error>> {
+    let feature_config = runtime::RuntimeFeatureConfig::default();
+    let tool_registry = GlobalToolRegistry::builtin();
+    let policy = permission_policy(permission_mode, &feature_config, &tool_registry)
+        .map_err(std::io::Error::other)?;
+    let mut runtime = ConversationRuntime::new_with_features(
+        session,
+        CliProviderRuntimeClient::new_with_telemetry(
+            session_id,
+            model,
+            false,
+            emit_output,
+            None,
+            tool_registry.clone(),
+            progress_reporter,
+            telemetry,
+            "turn_mode",
+        )?,
+        CliToolExecutor::new(None, emit_output, tool_registry, None),
+        policy,
+        system_prompt,
+        &feature_config,
+    );
+    if emit_output {
+        runtime = runtime.with_hook_progress_reporter(Box::new(CliHookProgressReporter));
+    }
+    Ok(BuiltRuntime::new_minimal(runtime))
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -9260,6 +9309,56 @@ mod tests {
         assert!(help.contains("/exit"));
         assert!(help.contains("Auto-save            .claw/sessions/<session-id>.jsonl"));
         assert!(help.contains("Resume latest        /resume latest"));
+    }
+
+    #[test]
+    fn live_cli_starts_without_runtime_or_system_prompt() {
+        let workspace = temp_dir();
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        with_current_dir(&workspace, || {
+            let cli = LiveCli::new(
+                ModelSelection::new("ollama/llama3.1:8b".to_string()),
+                true,
+                None,
+                PermissionMode::ReadOnly,
+            )
+            .expect("live cli should initialize");
+
+            assert!(cli.runtime.is_none());
+            assert!(cli.system_prompt.is_none());
+            assert!(cli.session_state.messages.is_empty());
+            assert!(cli.session.path.exists());
+        });
+    }
+
+    #[test]
+    fn live_cli_records_direct_turn_without_runtime() {
+        let workspace = temp_dir();
+        fs::create_dir_all(&workspace).expect("workspace");
+
+        with_current_dir(&workspace, || {
+            let mut cli = LiveCli::new(
+                ModelSelection::new("ollama/llama3.1:8b".to_string()),
+                true,
+                None,
+                PermissionMode::ReadOnly,
+            )
+            .expect("live cli should initialize");
+
+            let summary = cli
+                .append_direct_answer("Reply with exactly: pong", "pong".to_string(), Vec::new())
+                .expect("direct turn should append");
+
+            assert!(cli.runtime.is_none());
+            assert!(cli.system_prompt.is_none());
+            assert_eq!(cli.session_state.messages.len(), 2);
+            assert_eq!(summary.iterations, 1);
+            assert_eq!(summary.tool_results.len(), 0);
+            assert_eq!(summary.usage.total_tokens(), 0);
+            let saved = Session::load_from_path(&cli.session.path).expect("session should reload");
+            assert_eq!(saved.messages.len(), 2);
+        });
     }
 
     #[test]
