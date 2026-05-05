@@ -25,6 +25,7 @@ pub mod mcp_tool_bridge;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
+pub mod planning;
 pub mod plugin_lifecycle;
 mod policy_engine;
 mod prompt;
@@ -108,6 +109,13 @@ pub use oauth::{
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
     PermissionPromptDecision, PermissionPrompter, PermissionRequest,
+};
+pub use planning::{
+    planning_agent_system_contract, summarize_incomplete_reasons, AcceptanceCriterion,
+    CompletionDecision, CompletionDecisionStatus, CompletionPolicy, IncompleteReason, PlannedTask,
+    PlannedTaskStatus, PlanningCoordinator, ReplanningAttempt, ReplanningError, ReplanningProposal,
+    ReplanningState, TaskPlanning, TaskPlanningChange, VerificationEvidence,
+    DEFAULT_MAX_REPLANNING_ITERATIONS,
 };
 pub use plugin_lifecycle::{
     DegradedMode, DiscoveryResult, PluginHealthcheck, PluginLifecycle, PluginLifecycleEvent,

@@ -48,7 +48,7 @@ use runtime::{
     ConversationMessage, ConversationRuntime, McpServerManager, McpTool, MessageRole, ModelPricing,
     OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
     PermissionPolicy, ProjectContext, PromptCacheEvent, ResolvedPermissionMode, RuntimeError,
-    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    Session, TokenUsage, ToolError, ToolExecutor, UsageTracker, DEFAULT_MAX_REPLANNING_ITERATIONS,
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -79,6 +79,7 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--context-llm-model",
     "--tool-agent-model",
     "--planning-agent-model",
+    "--max-replanning-iterations",
     "--output-format",
     "--permission-mode",
     "--dangerously-skip-permissions",
@@ -148,12 +149,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Prompt {
             prompt,
             models,
+            planning_options,
             output_format,
             allowed_tools,
             permission_mode,
         } => run_prompt_with_router(
             &prompt,
             models,
+            planning_options,
             output_format,
             allowed_tools,
             permission_mode,
@@ -164,9 +167,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Init { output_format } => run_init(output_format)?,
         CliAction::Repl {
             models,
+            planning_options,
             allowed_tools,
             permission_mode,
-        } => run_repl(models, allowed_tools, permission_mode)?,
+        } => run_repl(models, planning_options, allowed_tools, permission_mode)?,
         CliAction::HelpTopic(topic) => print_help_topic(topic),
         CliAction::Help { output_format } => print_help(output_format)?,
     }
@@ -217,6 +221,7 @@ enum CliAction {
     Prompt {
         prompt: String,
         models: ModelSelection,
+        planning_options: PlanningOptions,
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
@@ -235,6 +240,7 @@ enum CliAction {
     },
     Repl {
         models: ModelSelection,
+        planning_options: PlanningOptions,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
     },
@@ -353,9 +359,23 @@ impl Default for ModelSelection {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlanningOptions {
+    max_replanning_iterations: u8,
+}
+
+impl Default for PlanningOptions {
+    fn default() -> Self {
+        Self {
+            max_replanning_iterations: DEFAULT_MAX_REPLANNING_ITERATIONS,
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut models = ModelSelection::default();
+    let mut planning_options = PlanningOptions::default();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -413,12 +433,27 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 permission_mode_override = Some(parse_permission_mode_arg(value)?);
                 index += 2;
             }
+            "--max-replanning-iterations" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "missing value for --max-replanning-iterations".to_string())?;
+                planning_options.max_replanning_iterations =
+                    parse_max_replanning_iterations(value)?;
+                index += 2;
+            }
             flag if flag.starts_with("--output-format=") => {
                 output_format = CliOutputFormat::parse(&flag[16..])?;
                 index += 1;
             }
             flag if flag.starts_with("--permission-mode=") => {
                 permission_mode_override = Some(parse_permission_mode_arg(&flag[18..])?);
+                index += 1;
+            }
+            flag if flag.starts_with("--max-replanning-iterations=") => {
+                planning_options.max_replanning_iterations = parse_max_replanning_iterations(
+                    flag.strip_prefix("--max-replanning-iterations=")
+                        .unwrap_or_default(),
+                )?;
                 index += 1;
             }
             "--dangerously-skip-permissions" => {
@@ -434,6 +469,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 return Ok(CliAction::Prompt {
                     prompt,
                     models,
+                    planning_options,
                     output_format,
                     allowed_tools: normalize_allowed_tools(&allowed_tool_values)?,
                     permission_mode: permission_mode_override
@@ -493,6 +529,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         let permission_mode = permission_mode_override.unwrap_or_else(default_permission_mode);
         return Ok(CliAction::Repl {
             models,
+            planning_options,
             allowed_tools,
             permission_mode,
         });
@@ -541,6 +578,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             Ok(CliAction::Prompt {
                 prompt,
                 models,
+                planning_options,
                 output_format,
                 allowed_tools,
                 permission_mode,
@@ -550,6 +588,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         _other => Ok(CliAction::Prompt {
             prompt: rest.join(" "),
             models,
+            planning_options,
             output_format,
             allowed_tools,
             permission_mode,
@@ -840,6 +879,19 @@ fn parse_permission_mode_arg(value: &str) -> Result<PermissionMode, String> {
             )
         })
         .map(permission_mode_from_label)
+}
+
+fn parse_max_replanning_iterations(value: &str) -> Result<u8, String> {
+    let parsed = value.parse::<u8>().map_err(|_| {
+        format!("unsupported value for --max-replanning-iterations: {value} (expected 0-255)")
+    })?;
+    if parsed == 0 {
+        return Err(
+            "--max-replanning-iterations must be at least 1 to avoid disabling completion recovery"
+                .to_string(),
+        );
+    }
+    Ok(parsed)
 }
 
 fn permission_mode_from_label(mode: &str) -> PermissionMode {
@@ -2480,10 +2532,17 @@ fn run_resume_command(
 
 fn run_repl(
     models: ModelSelection,
+    planning_options: PlanningOptions,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(models, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(
+        models,
+        true,
+        allowed_tools,
+        permission_mode,
+        planning_options,
+    )?;
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
     println!("{}", cli.startup_banner());
@@ -2530,6 +2589,7 @@ fn run_repl(
 fn run_prompt_with_router(
     prompt: &str,
     models: ModelSelection,
+    planning_options: PlanningOptions,
     output_format: CliOutputFormat,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
@@ -2584,6 +2644,7 @@ fn run_prompt_with_router(
                 true,
                 allowed_tools,
                 permission_mode,
+                planning_options,
             )?;
             match output_format {
                 CliOutputFormat::Text => {
@@ -2713,6 +2774,7 @@ struct ManagedSessionSummary {
 struct LiveCli {
     model: String,
     models: ModelSelection,
+    planning_options: PlanningOptions,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
     system_prompt: Option<Vec<String>>,
@@ -4038,6 +4100,7 @@ impl LiveCli {
         _enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        planning_options: PlanningOptions,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let session_state = Session::new();
         let session = create_managed_session_handle(&session_state.session_id)?;
@@ -4046,6 +4109,7 @@ impl LiveCli {
         let cli = Self {
             model,
             models,
+            planning_options,
             allowed_tools,
             permission_mode,
             system_prompt: None,
@@ -4146,6 +4210,7 @@ impl LiveCli {
             model,
             RuntimeBuildKind::FullAgent,
             None,
+            None,
         )
         .map(|(runtime, monitor, _)| (runtime, monitor))
     }
@@ -4155,12 +4220,18 @@ impl LiveCli {
         emit_output: bool,
         model: &str,
         kind: RuntimeBuildKind,
+        mode: Option<TurnMode>,
         telemetry: Option<TurnTelemetryRecorder>,
     ) -> Result<(BuiltRuntime, HookAbortMonitor, Duration), Box<dyn std::error::Error>> {
         let started = Instant::now();
         let hook_abort_signal = runtime::HookAbortSignal::new();
         let session = self.session_state.clone();
-        let system_prompt = self.system_prompt()?;
+        let mut system_prompt = self.system_prompt()?;
+        if matches!(mode, Some(TurnMode::PlanningAgent)) {
+            system_prompt.push(runtime::planning_agent_system_contract(
+                self.planning_options.max_replanning_iterations,
+            ));
+        }
         let runtime = match kind {
             RuntimeBuildKind::Context => build_context_runtime_with_request_telemetry(
                 session,
@@ -4263,7 +4334,13 @@ impl LiveCli {
             .to_string();
         let runtime_kind = RuntimeBuildKind::for_turn_mode(mode);
         let (mut runtime, hook_abort_monitor, prepare_elapsed) = self
-            .prepare_turn_runtime_with_telemetry(true, &model, runtime_kind, telemetry.clone())?;
+            .prepare_turn_runtime_with_telemetry(
+                true,
+                &model,
+                runtime_kind,
+                Some(mode),
+                telemetry.clone(),
+            )?;
         if let Some(telemetry) = &telemetry {
             record_runtime_prepare(telemetry, prepare_elapsed);
         }
@@ -4452,6 +4529,7 @@ impl LiveCli {
                 false,
                 &model,
                 runtime_kind,
+                Some(mode),
                 Some(telemetry.clone()),
             )?;
         record_runtime_prepare(&telemetry, prepare_elapsed);
@@ -8168,6 +8246,10 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
+        "  --max-replanning-iterations N  Max PlanningAgent replanning loop count (default 3)"
+    )?;
+    writeln!(
+        out,
         "  --output-format FORMAT     Non-interactive output format: text or json"
     )?;
     writeln!(
@@ -8272,8 +8354,8 @@ mod tests {
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
-        ModelRequestTelemetry, ModelRole, ModelSelection, SlashCommand, StatusUsage,
-        TurnExecutionStep, TurnExecutionTrace, TurnMode, TurnRoute, DEFAULT_MODEL,
+        ModelRequestTelemetry, ModelRole, ModelSelection, PlanningOptions, SlashCommand,
+        StatusUsage, TurnExecutionStep, TurnExecutionTrace, TurnMode, TurnRoute, DEFAULT_MODEL,
     };
     use api::{
         ApiError, InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ToolChoice,
@@ -8519,6 +8601,7 @@ mod tests {
             parse_args(&[]).expect("args should parse"),
             CliAction::Repl {
                 models: ModelSelection::default(),
+                planning_options: PlanningOptions::default(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
             }
@@ -8607,6 +8690,7 @@ mod tests {
             CliAction::Prompt {
                 prompt: "hello world".to_string(),
                 models: ModelSelection::default(),
+                planning_options: PlanningOptions::default(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -8630,6 +8714,7 @@ mod tests {
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
                 models: ModelSelection::new("claude-opus".to_string()),
+                planning_options: PlanningOptions::default(),
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -8652,6 +8737,7 @@ mod tests {
             CliAction::Prompt {
                 prompt: "explain this".to_string(),
                 models: ModelSelection::new("claude-opus-4-6".to_string()),
+                planning_options: PlanningOptions::default(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -8836,10 +8922,65 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
                 models: ModelSelection::default(),
+                planning_options: PlanningOptions::default(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
             }
         );
+    }
+
+    #[test]
+    fn parses_max_replanning_iterations_for_repl() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec!["--max-replanning-iterations".to_string(), "5".to_string()];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Repl {
+                models: ModelSelection::default(),
+                planning_options: PlanningOptions {
+                    max_replanning_iterations: 5,
+                },
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_max_replanning_iterations_for_prompt() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--max-replanning-iterations=4".to_string(),
+            "prompt".to_string(),
+            "ship".to_string(),
+            "feature".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Prompt {
+                prompt: "ship feature".to_string(),
+                models: ModelSelection::default(),
+                planning_options: PlanningOptions {
+                    max_replanning_iterations: 4,
+                },
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_zero_max_replanning_iterations() {
+        let error = parse_args(&[
+            "--max-replanning-iterations=0".to_string(),
+            "prompt".to_string(),
+            "ship feature".to_string(),
+        ])
+        .expect_err("zero replanning iterations should be rejected");
+        assert!(error.contains("must be at least 1"));
     }
 
     #[test]
@@ -8855,6 +8996,7 @@ mod tests {
             parse_args(&args).expect("args should parse"),
             CliAction::Repl {
                 models: ModelSelection::default(),
+                planning_options: PlanningOptions::default(),
                 allowed_tools: Some(
                     ["glob_search", "read_file", "write_file"]
                         .into_iter()
@@ -9041,6 +9183,7 @@ mod tests {
             CliAction::Prompt {
                 prompt: "help me debug".to_string(),
                 models: ModelSelection::default(),
+                planning_options: PlanningOptions::default(),
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
@@ -9322,6 +9465,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::ReadOnly,
+                PlanningOptions::default(),
             )
             .expect("live cli should initialize");
 
@@ -9343,6 +9487,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::ReadOnly,
+                PlanningOptions::default(),
             )
             .expect("live cli should initialize");
 
@@ -9392,6 +9537,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
+                PlanningOptions::default(),
             )
             .expect("cli should initialize")
             .startup_banner()
