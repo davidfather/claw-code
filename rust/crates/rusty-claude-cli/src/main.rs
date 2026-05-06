@@ -74,6 +74,10 @@ const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--version",
     "-V",
     "--model",
+    "--enable-router",
+    "--use-router",
+    "--disable-router",
+    "--no-router",
     "--router-model",
     "--direct-llm-model",
     "--context-llm-model",
@@ -288,6 +292,7 @@ enum ModelRole {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ModelSelection {
     default_model: String,
+    router_enabled: bool,
     router_model: Option<String>,
     direct_llm_model: Option<String>,
     context_llm_model: Option<String>,
@@ -299,6 +304,7 @@ impl ModelSelection {
     fn new(default_model: String) -> Self {
         Self {
             default_model,
+            router_enabled: false,
             router_model: None,
             direct_llm_model: None,
             context_llm_model: None,
@@ -309,6 +315,18 @@ impl ModelSelection {
 
     fn default_model(&self) -> &str {
         &self.default_model
+    }
+
+    fn router_enabled(&self) -> bool {
+        self.router_enabled
+    }
+
+    fn disable_router(&mut self) {
+        self.router_enabled = false;
+    }
+
+    fn enable_router(&mut self) {
+        self.router_enabled = true;
     }
 
     fn set_default_model(&mut self, model: String) {
@@ -458,6 +476,14 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--dangerously-skip-permissions" => {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
+                index += 1;
+            }
+            "--enable-router" | "--use-router" => {
+                models.enable_router();
+                index += 1;
+            }
+            "--disable-router" | "--no-router" => {
+                models.disable_router();
                 index += 1;
             }
             "-p" => {
@@ -2596,8 +2622,7 @@ fn run_prompt_with_router(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let router_model = models.resolve(ModelRole::Router).to_string();
     let telemetry = new_turn_telemetry_recorder();
-    let (route, router_step) =
-        route_turn_with_trace_and_telemetry(prompt, &router_model, Some(&telemetry));
+    let (route, router_step) = route_turn_for_model_selection(prompt, &models, Some(&telemetry));
     let mut trace = TurnExecutionTrace::new(route.mode);
     report_router_result(output_format, &router_step, &route);
     trace.push(router_step);
@@ -3509,6 +3534,32 @@ fn route_turn_with_trace(input: &str, model: &str) -> (TurnRoute, TurnExecutionS
     route_turn_with_trace_and_telemetry(input, model, None)
 }
 
+fn route_turn_for_model_selection(
+    input: &str,
+    models: &ModelSelection,
+    telemetry: Option<&TurnTelemetryRecorder>,
+) -> (TurnRoute, TurnExecutionStep) {
+    if models.router_enabled() {
+        let router_model = models.resolve(ModelRole::Router);
+        route_turn_with_trace_and_telemetry(input, router_model, telemetry)
+    } else {
+        route_turn_with_disabled_router()
+    }
+}
+
+fn route_turn_with_disabled_router() -> (TurnRoute, TurnExecutionStep) {
+    let route = TurnRoute::planning_agent("router disabled; using PlanningAgent");
+    let step = TurnExecutionStep {
+        phase: "router".to_string(),
+        turn_mode: None,
+        model: None,
+        elapsed_ms: 0,
+        error: None,
+        raw_response: None,
+    };
+    (route, step)
+}
+
 fn route_turn_with_trace_and_telemetry(
     input: &str,
     model: &str,
@@ -4347,10 +4398,9 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let router_model = self.models.resolve(ModelRole::Router).to_string();
         let telemetry = new_turn_telemetry_recorder();
         let (route, router_step) =
-            route_turn_with_trace_and_telemetry(input, &router_model, Some(&telemetry));
+            route_turn_for_model_selection(input, &self.models, Some(&telemetry));
         let mut trace = TurnExecutionTrace::new(route.mode);
         report_router_result(CliOutputFormat::Text, &router_step, &route);
         trace.push(router_step);
@@ -4486,7 +4536,7 @@ impl LiveCli {
                 let router_model = self.models.resolve(ModelRole::Router).to_string();
                 let telemetry = new_turn_telemetry_recorder();
                 let (route, router_step) =
-                    route_turn_with_trace_and_telemetry(input, &router_model, Some(&telemetry));
+                    route_turn_for_model_selection(input, &self.models, Some(&telemetry));
                 let mut trace = TurnExecutionTrace::new(route.mode);
                 report_router_result(CliOutputFormat::Json, &router_step, &route);
                 trace.push(router_step);
@@ -8281,17 +8331,17 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Usage:")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--router-model MODEL] [--allowedTools TOOL[,TOOL...]]"
+        "  claw [--model MODEL] [--enable-router] [--router-model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--router-model MODEL] [--output-format text|json] prompt TEXT"
+        "  claw [--model MODEL] [--enable-router] [--router-model MODEL] [--output-format text|json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--router-model MODEL] [--output-format text|json] TEXT"
+        "  claw [--model MODEL] [--enable-router] [--router-model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
@@ -8335,7 +8385,15 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --router-model MODEL       Model used only to classify the turn mode"
+        "  --enable-router, --use-router  Enable router LLM turn-mode classification"
+    )?;
+    writeln!(
+        out,
+        "  --router-model MODEL       Model used to classify turn mode when router is enabled"
+    )?;
+    writeln!(
+        out,
+        "  --disable-router, --no-router  Keep router disabled and always use PlanningAgent (default)"
     )?;
     writeln!(
         out,
@@ -8460,7 +8518,7 @@ mod tests {
         permission_policy, print_help_to, push_output_block, render_config_report,
         render_diff_report, render_diff_report_for, render_memory_report, render_repl_help,
         render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command,
+        resume_supported_slash_commands, route_turn_for_model_selection, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
         InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, LocalHelpTopic,
@@ -9091,6 +9149,56 @@ mod tests {
                 permission_mode: PermissionMode::ReadOnly,
             }
         );
+    }
+
+    #[test]
+    fn default_prompt_forces_planning_route_when_router_is_disabled() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--model".to_string(),
+            "ollama/llama3.1:8b".to_string(),
+            "prompt".to_string(),
+            "How many files are in the current folder?".to_string(),
+        ];
+        let action = parse_args(&args).expect("args should parse");
+        let CliAction::Prompt { models, .. } = action else {
+            panic!("expected prompt action");
+        };
+        assert!(!models.router_enabled());
+
+        let (route, step) = route_turn_for_model_selection(
+            "How many files are in the current folder?",
+            &models,
+            None,
+        );
+        assert_eq!(route.mode, TurnMode::PlanningAgent);
+        assert_eq!(route.reason, "router disabled; using PlanningAgent");
+        assert_eq!(step.phase, "router");
+        assert!(step.model.is_none());
+        assert_eq!(step.elapsed_ms, 0);
+    }
+
+    #[test]
+    fn parses_enable_router_for_prompt() {
+        let _guard = env_lock();
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        let args = vec![
+            "--enable-router".to_string(),
+            "--router-model".to_string(),
+            "ollama/llama3.2:1b".to_string(),
+            "--model".to_string(),
+            "ollama/llama3.1:8b".to_string(),
+            "prompt".to_string(),
+            "Reply with exactly: pong".to_string(),
+        ];
+        let action = parse_args(&args).expect("args should parse");
+        let CliAction::Prompt { models, .. } = action else {
+            panic!("expected prompt action");
+        };
+
+        assert!(models.router_enabled());
+        assert_eq!(models.resolve(ModelRole::Router), "ollama/llama3.2:1b");
     }
 
     #[test]
