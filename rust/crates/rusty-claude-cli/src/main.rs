@@ -3490,21 +3490,29 @@ fn provider_client_for_model(model: &str) -> Result<ProviderClient, Box<dyn std:
 
 fn build_turn_router_prompt(input: &str) -> String {
     format!(
-        r#"Return one JSON object only. No markdown. No quoted JSON string.
+        r#"Return one JSON object only. No markdown.
 
 Keys: mode, direct_answer, reason.
-Rules:
-- Exact-text requests MUST use DirectFinal with the exact direct_answer.
-- DirectLlm/ContextLlm/ToolAgent/PlanningAgent MUST use direct_answer:null.
-Modes:
-- DirectFinal: exact deterministic reply; direct_answer is required.
-- DirectLlm: general answer, no context or tools.
-- ContextLlm: needs memory/session/system prompt, no tools.
-- ToolAgent: needs files, shell, git, or tools.
-- PlanningAgent: multi-step coding, verification, commits, docs, or planning.
 
-If the user says "Reply with exactly: X", use:
-{{"mode":"DirectFinal","direct_answer":"X","reason":"exact output"}}
+Rules:
+- Exact deterministic reply -> DirectFinal.
+- General answer without project/session/tool context -> DirectLlm.
+- Needs session memory or system context only -> ContextLlm.
+- Needs any external action or observable environment state -> ToolAgent.
+- Needs multi-step implementation, verification, docs, commits, or planning -> PlanningAgent.
+- For all non-DirectFinal modes, direct_answer must be null.
+
+External action or observable environment state includes local files, directories, repository state, git, shell, web, MCP, plugins, skills, or any tool-provided information.
+
+Examples:
+Reply with exactly: pong
+{{"mode":"DirectFinal","direct_answer":"pong","reason":"exact output"}}
+
+AGENTS.md를 읽고 slash commands가 뭐가 있는지 알려줘.
+{{"mode":"ToolAgent","direct_answer":null,"reason":"requires local file access"}}
+
+현재 세션에서 기억하는 slash commands를 알려줘.
+{{"mode":"ContextLlm","direct_answer":null,"reason":"requires session context only"}}
 
 User input:
 {input}"#
@@ -8337,13 +8345,13 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_cost_report, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        build_turn_router_prompt, create_managed_session_handle, describe_tool_progress,
+        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_cost_report,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         normalize_permission_mode, parse_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, parse_turn_route_response,
@@ -8434,6 +8442,20 @@ mod tests {
         assert!(!route.needs_session_history);
         assert!(!route.needs_tools);
         assert!(route.reason.contains("no-tools DirectLlm"));
+    }
+
+    #[test]
+    fn router_contract_classifies_local_file_access_as_tool_agent() {
+        let prompt =
+            build_turn_router_prompt("AGENTS.md를 읽고 slash commands가 뭐가 있는지 알려줘.");
+
+        assert!(prompt.contains("observable environment state -> ToolAgent"));
+        assert!(prompt.contains("local files"));
+        assert!(prompt.contains("AGENTS.md"));
+        assert!(
+            prompt.contains(r#""mode":"ToolAgent""#),
+            "contract should include a local-file ToolAgent example"
+        );
     }
 
     #[test]
