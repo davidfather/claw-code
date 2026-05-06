@@ -2599,6 +2599,7 @@ fn run_prompt_with_router(
     let (route, router_step) =
         route_turn_with_trace_and_telemetry(prompt, &router_model, Some(&telemetry));
     let mut trace = TurnExecutionTrace::new(route.mode);
+    report_router_result(output_format, &router_step, &route);
     trace.push(router_step);
     match route.mode {
         TurnMode::DirectFinal => {
@@ -2606,11 +2607,9 @@ fn run_prompt_with_router(
             let answer = route.direct_answer.clone().unwrap_or_default();
             let summary = persist_standalone_direct_turn(prompt, &answer)?;
             record_turn_summary(&telemetry, &summary);
-            trace.push(TurnExecutionStep::turn_mode(
-                route.mode,
-                None,
-                started.elapsed(),
-            ));
+            let turn_step = TurnExecutionStep::turn_mode(route.mode, None, started.elapsed());
+            report_turn_mode_result(output_format, &turn_step);
+            trace.push(turn_step);
             trace.sync_telemetry(&telemetry);
             emit_direct_prompt_output(&summary, &router_model, output_format, &route, &trace)?;
             Ok(())
@@ -2618,18 +2617,23 @@ fn run_prompt_with_router(
         TurnMode::DirectLlm => {
             let model = models.resolve(ModelRole::DirectLlm).to_string();
             let started = Instant::now();
-            let summary = run_standalone_direct_llm_turn(
+            let summary_result = run_standalone_direct_llm_turn(
                 prompt,
                 &model,
                 output_format,
                 Some(telemetry.clone()),
-            )?;
-            record_turn_summary(&telemetry, &summary);
-            trace.push(TurnExecutionStep::turn_mode(
+            );
+            let error = summary_result.as_ref().err().map(ToString::to_string);
+            let turn_step = TurnExecutionStep::turn_mode_with_error(
                 route.mode,
                 Some(model.clone()),
                 started.elapsed(),
-            ));
+                error,
+            );
+            report_turn_mode_result(output_format, &turn_step);
+            trace.push(turn_step);
+            let summary = summary_result?;
+            record_turn_summary(&telemetry, &summary);
             trace.sync_telemetry(&telemetry);
             emit_direct_prompt_output(&summary, &model, output_format, &route, &trace)?;
             Ok(())
@@ -2650,11 +2654,15 @@ fn run_prompt_with_router(
                 CliOutputFormat::Text => {
                     let started = Instant::now();
                     let result = cli.run_agent_turn(prompt, route.mode, Some(telemetry.clone()));
-                    trace.push(TurnExecutionStep::turn_mode(
+                    let error = result.as_ref().err().map(ToString::to_string);
+                    let turn_step = TurnExecutionStep::turn_mode_with_error(
                         route.mode,
                         Some(execution_model),
                         started.elapsed(),
-                    ));
+                        error,
+                    );
+                    report_turn_mode_result(output_format, &turn_step);
+                    trace.push(turn_step);
                     trace.sync_telemetry(&telemetry);
                     emit_turn_execution_trace_text(&trace);
                     result
@@ -2859,12 +2867,21 @@ impl TurnExecutionStep {
     }
 
     fn turn_mode(mode: TurnMode, model: Option<String>, elapsed: Duration) -> Self {
+        Self::turn_mode_with_error(mode, model, elapsed, None)
+    }
+
+    fn turn_mode_with_error(
+        mode: TurnMode,
+        model: Option<String>,
+        elapsed: Duration,
+        error: Option<String>,
+    ) -> Self {
         Self {
             phase: "turn_mode".to_string(),
             turn_mode: Some(mode),
             model,
             elapsed_ms: elapsed.as_millis(),
-            error: None,
+            error,
             raw_response: None,
         }
     }
@@ -3223,6 +3240,61 @@ impl TurnExecutionTrace {
 
 fn emit_turn_execution_trace_text(trace: &TurnExecutionTrace) {
     eprintln!("{}", trace.render_text());
+}
+
+fn report_router_result(
+    output_format: CliOutputFormat,
+    step: &TurnExecutionStep,
+    route: &TurnRoute,
+) {
+    emit_turn_step_result(output_format, &format_router_result_line(step, route));
+}
+
+fn report_turn_mode_result(output_format: CliOutputFormat, step: &TurnExecutionStep) {
+    emit_turn_step_result(output_format, &format_turn_mode_result_line(step));
+}
+
+fn emit_turn_step_result(output_format: CliOutputFormat, line: &str) {
+    match output_format {
+        CliOutputFormat::Text => println!("{line}"),
+        CliOutputFormat::Json => eprintln!("{line}"),
+    }
+}
+
+fn format_router_result_line(step: &TurnExecutionStep, route: &TurnRoute) -> String {
+    format!(
+        "[router] mode={} model={} elapsed_ms={} reason={}",
+        route.mode.as_str(),
+        step.model.as_deref().unwrap_or("-"),
+        step.elapsed_ms,
+        one_line_summary(&route.reason, 180)
+    )
+}
+
+fn format_turn_mode_result_line(step: &TurnExecutionStep) -> String {
+    let mode = step.turn_mode.map_or("-", TurnMode::as_str);
+    let model = step.model.as_deref().unwrap_or("-");
+    let status = if step.error.is_some() {
+        "error"
+    } else {
+        "done"
+    };
+    let mut rendered = format!(
+        "[turn] mode={} model={} elapsed_ms={} status={}",
+        mode, model, step.elapsed_ms, status
+    );
+    if let Some(error) = &step.error {
+        rendered.push_str(" error=");
+        rendered.push_str(&one_line_summary(error, 180));
+    }
+    rendered
+}
+
+fn one_line_summary(value: &str, limit: usize) -> String {
+    truncate_for_summary(
+        &value.split_whitespace().collect::<Vec<_>>().join(" "),
+        limit,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4280,6 +4352,7 @@ impl LiveCli {
         let (route, router_step) =
             route_turn_with_trace_and_telemetry(input, &router_model, Some(&telemetry));
         let mut trace = TurnExecutionTrace::new(route.mode);
+        report_router_result(CliOutputFormat::Text, &router_step, &route);
         trace.push(router_step);
         match route.mode {
             TurnMode::DirectFinal => {
@@ -4288,11 +4361,9 @@ impl LiveCli {
                 println!("{answer}");
                 let summary = self.append_direct_answer(input, answer, Vec::new())?;
                 record_turn_summary(&telemetry, &summary);
-                trace.push(TurnExecutionStep::turn_mode(
-                    route.mode,
-                    None,
-                    started.elapsed(),
-                ));
+                let turn_step = TurnExecutionStep::turn_mode(route.mode, None, started.elapsed());
+                report_turn_mode_result(CliOutputFormat::Text, &turn_step);
+                trace.push(turn_step);
                 trace.sync_telemetry(&telemetry);
                 emit_turn_execution_trace_text(&trace);
                 return Ok(());
@@ -4300,13 +4371,18 @@ impl LiveCli {
             TurnMode::DirectLlm => {
                 let model = self.models.resolve(ModelRole::DirectLlm).to_string();
                 let started = Instant::now();
-                let summary = self.run_direct_llm_turn(input, true, Some(telemetry.clone()))?;
-                record_turn_summary(&telemetry, &summary);
-                trace.push(TurnExecutionStep::turn_mode(
+                let summary_result = self.run_direct_llm_turn(input, true, Some(telemetry.clone()));
+                let error = summary_result.as_ref().err().map(ToString::to_string);
+                let turn_step = TurnExecutionStep::turn_mode_with_error(
                     route.mode,
                     Some(model),
                     started.elapsed(),
-                ));
+                    error,
+                );
+                report_turn_mode_result(CliOutputFormat::Text, &turn_step);
+                trace.push(turn_step);
+                let summary = summary_result?;
+                record_turn_summary(&telemetry, &summary);
                 trace.sync_telemetry(&telemetry);
                 emit_turn_execution_trace_text(&trace);
                 return Ok(());
@@ -4318,11 +4394,15 @@ impl LiveCli {
                     .to_string();
                 let started = Instant::now();
                 let result = self.run_agent_turn(input, route.mode, Some(telemetry.clone()));
-                trace.push(TurnExecutionStep::turn_mode(
+                let error = result.as_ref().err().map(ToString::to_string);
+                let turn_step = TurnExecutionStep::turn_mode_with_error(
                     route.mode,
                     Some(model),
                     started.elapsed(),
-                ));
+                    error,
+                );
+                report_turn_mode_result(CliOutputFormat::Text, &turn_step);
+                trace.push(turn_step);
                 trace.sync_telemetry(&telemetry);
                 emit_turn_execution_trace_text(&trace);
                 return result;
@@ -4408,6 +4488,7 @@ impl LiveCli {
                 let (route, router_step) =
                     route_turn_with_trace_and_telemetry(input, &router_model, Some(&telemetry));
                 let mut trace = TurnExecutionTrace::new(route.mode);
+                report_router_result(CliOutputFormat::Json, &router_step, &route);
                 trace.push(router_step);
                 match route.mode {
                     TurnMode::DirectFinal => {
@@ -4415,11 +4496,10 @@ impl LiveCli {
                         let answer = route.direct_answer.clone().unwrap_or_default();
                         let summary = self.append_direct_answer(input, answer, Vec::new())?;
                         record_turn_summary(&telemetry, &summary);
-                        trace.push(TurnExecutionStep::turn_mode(
-                            route.mode,
-                            None,
-                            started.elapsed(),
-                        ));
+                        let turn_step =
+                            TurnExecutionStep::turn_mode(route.mode, None, started.elapsed());
+                        report_turn_mode_result(CliOutputFormat::Json, &turn_step);
+                        trace.push(turn_step);
                         trace.sync_telemetry(&telemetry);
                         print_prompt_json_summary(
                             &summary,
@@ -4432,14 +4512,19 @@ impl LiveCli {
                     TurnMode::DirectLlm => {
                         let model = self.models.resolve(ModelRole::DirectLlm).to_string();
                         let started = Instant::now();
-                        let summary =
-                            self.run_direct_llm_turn(input, false, Some(telemetry.clone()))?;
-                        record_turn_summary(&telemetry, &summary);
-                        trace.push(TurnExecutionStep::turn_mode(
+                        let summary_result =
+                            self.run_direct_llm_turn(input, false, Some(telemetry.clone()));
+                        let error = summary_result.as_ref().err().map(ToString::to_string);
+                        let turn_step = TurnExecutionStep::turn_mode_with_error(
                             route.mode,
                             Some(model.clone()),
                             started.elapsed(),
-                        ));
+                            error,
+                        );
+                        report_turn_mode_result(CliOutputFormat::Json, &turn_step);
+                        trace.push(turn_step);
+                        let summary = summary_result?;
+                        record_turn_summary(&telemetry, &summary);
                         trace.sync_telemetry(&telemetry);
                         print_prompt_json_summary(&summary, &model, Some(&route), Some(&trace))?;
                         Ok(())
@@ -4544,19 +4629,35 @@ impl LiveCli {
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
-        let summary = result?;
-        record_turn_summary(&telemetry, &summary);
-        self.replace_runtime(runtime)?;
-        self.persist_session()?;
         let mut trace = trace.unwrap_or_else(|| TurnExecutionTrace::new(mode));
-        trace.push(TurnExecutionStep::turn_mode(
-            mode,
-            Some(model.clone()),
-            started.elapsed(),
-        ));
-        trace.sync_telemetry(&telemetry);
-        print_prompt_json_summary(&summary, &model, route, Some(&trace))?;
-        Ok(())
+        match result {
+            Ok(summary) => {
+                record_turn_summary(&telemetry, &summary);
+                self.replace_runtime(runtime)?;
+                self.persist_session()?;
+                let turn_step =
+                    TurnExecutionStep::turn_mode(mode, Some(model.clone()), started.elapsed());
+                report_turn_mode_result(CliOutputFormat::Json, &turn_step);
+                trace.push(turn_step);
+                trace.sync_telemetry(&telemetry);
+                print_prompt_json_summary(&summary, &model, route, Some(&trace))?;
+                Ok(())
+            }
+            Err(error) => {
+                let error_message = error.to_string();
+                let turn_step = TurnExecutionStep::turn_mode_with_error(
+                    mode,
+                    Some(model),
+                    started.elapsed(),
+                    Some(error_message),
+                );
+                report_turn_mode_result(CliOutputFormat::Json, &turn_step);
+                trace.push(turn_step);
+                trace.sync_telemetry(&telemetry);
+                runtime.shutdown_plugins()?;
+                Err(Box::new(error))
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8350,8 +8451,9 @@ mod tests {
         format_commit_skipped_report, format_compact_report, format_cost_report,
         format_internal_prompt_progress_line, format_issue_report, format_model_report,
         format_model_switch_report, format_permissions_report, format_permissions_switch_report,
-        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
-        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
+        format_pr_report, format_resume_report, format_router_result_line, format_status_report,
+        format_tool_call_start, format_tool_result, format_turn_mode_result_line,
+        format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, format_user_visible_api_error,
         normalize_permission_mode, parse_args, parse_git_status_branch,
         parse_git_status_metadata_for, parse_git_workspace_summary, parse_turn_route_response,
@@ -8852,6 +8954,46 @@ mod tests {
             0
         );
         assert!(rendered.contains("requests=0"));
+    }
+
+    #[test]
+    fn router_result_line_reports_selected_mode_model_elapsed_and_reason() {
+        let route = TurnRoute::tool_agent("requires local file access");
+        let step = TurnExecutionStep::router(
+            "ollama/llama3.1:8b".to_string(),
+            Duration::from_millis(97),
+            Some(r#"{"mode":"ToolAgent"}"#.to_string()),
+            None,
+        );
+
+        assert_eq!(
+            format_router_result_line(&step, &route),
+            "[router] mode=tool_agent model=ollama/llama3.1:8b elapsed_ms=97 reason=requires local file access"
+        );
+    }
+
+    #[test]
+    fn turn_result_line_reports_model_elapsed_status_and_compact_error() {
+        let done = TurnExecutionStep::turn_mode(
+            TurnMode::ToolAgent,
+            Some("ollama/llama3.1:8b".to_string()),
+            Duration::from_millis(424),
+        );
+        assert_eq!(
+            format_turn_mode_result_line(&done),
+            "[turn] mode=tool_agent model=ollama/llama3.1:8b elapsed_ms=424 status=done"
+        );
+
+        let failed = TurnExecutionStep::turn_mode_with_error(
+            TurnMode::DirectLlm,
+            Some("ollama/llama3.2:1b".to_string()),
+            Duration::from_millis(3),
+            Some("first line\nsecond line".to_string()),
+        );
+        assert_eq!(
+            format_turn_mode_result_line(&failed),
+            "[turn] mode=direct_llm model=ollama/llama3.2:1b elapsed_ms=3 status=error error=first line second line"
+        );
     }
 
     #[test]
