@@ -582,11 +582,14 @@ fn read_optional_json_object(
         Err(error) => return Err(ConfigError::Io(error)),
     };
 
+    // Windows PowerShell can write UTF-8 JSON files with a leading BOM.
+    let contents = contents.strip_prefix('\u{feff}').unwrap_or(&contents);
+
     if contents.trim().is_empty() {
         return Ok(Some(BTreeMap::new()));
     }
 
-    let parsed = match JsonValue::parse(&contents) {
+    let parsed = match JsonValue::parse(contents) {
         Ok(parsed) => parsed,
         Err(_error) if is_legacy_config => return Ok(None),
         Err(error) => return Err(ConfigError::Parse(format!("{}: {error}", path.display()))),
@@ -1600,6 +1603,34 @@ mod tests {
             parse_permission_mode_label("dontAsk", "test").expect("dontAsk should resolve"),
             ResolvedPermissionMode::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn loads_settings_json_with_utf8_bom() {
+        // given
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        let project_config_dir = cwd.join(".claw");
+        fs::create_dir_all(&project_config_dir).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(br#"{"permissions":{"defaultMode":"dontAsk"}}"#);
+        fs::write(project_config_dir.join("settings.json"), bytes).expect("write settings");
+
+        // when
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("settings with BOM should load");
+
+        // then
+        assert_eq!(
+            loaded.permission_mode(),
+            Some(ResolvedPermissionMode::DangerFullAccess)
+        );
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
